@@ -180,7 +180,10 @@ export function renderIndex(opts: RenderOptions): string {
   })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026')};
+    .replace(/&/g, '\\u0026')
+    // U+2028/2029 在 JS 里是换行符，会在 script 标签内造成语法错误
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029')};
 </script>
 <script src="/app.js"></script>
 </body>

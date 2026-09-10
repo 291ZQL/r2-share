@@ -24,7 +24,7 @@ import {
   removeDir,
   rebuildIndex,
   readIndex,
-  guessType,
+  resolveType,
 } from './store';
 
 export interface Env {
@@ -83,7 +83,12 @@ function clientIP(c: any): string {
  * 该标记同时传给前端（CFG.local），控制下载/索引走本地代理路由。
  */
 function isLocal(c: any): boolean {
-  return !c.env.R2_ACCESS_KEY_ID || !c.env.R2_ACCOUNT_ID;
+  return (
+    !c.env.R2_ACCESS_KEY_ID ||
+    !c.env.R2_SECRET_ACCESS_KEY ||
+    !c.env.R2_ACCOUNT_ID ||
+    !c.env.BUCKET_NAME
+  );
 }
 
 /**
@@ -142,7 +147,16 @@ app.put('/api/local-put', async (c) => {
   const key = sanitizePath(c.req.query('key'));
   if (!key) return c.text('缺少 key', 400);
 
-  const ctype = c.req.header('content-type') || 'application/octet-stream';
+  // 显式校验大小：/api/sign 校验的是前端「声明」的 size，实际 PUT 的 body 可以更大。
+  // 这里按 content-length 兜一道，让超限请求在入口就被拒，而不是打到 R2 才失败。
+  const max = parseInt(c.env.MAX_UPLOAD || '0', 10);
+  const len = parseInt(c.req.header('content-length') || '0', 10) || 0;
+  if (max > 0 && len > max) {
+    return c.json({ error: `文件超过大小上限（${Math.floor(max / 1048576)}MB）` }, 413);
+  }
+
+  // 代理模式下 Content-Type 不参与签名，改由服务端按扩展名决定（更准，见 resolveType）
+  const ctype = resolveType(key, c.req.header('content-type'));
 
   if (isLocal(c)) {
     // 本地 miniflare：流式 put 会落盘为 0 字节，只能读进内存再写
@@ -220,10 +234,15 @@ app.post('/api/sign', async (c) => {
   const path = sanitizePath(body.path);
   if (!path) return c.json({ error: '路径非法' }, 400);
 
-  // 防注入：content-type 只参与签名，不允许换行/控制字符
-  const ctype = String(body.type || 'application/octet-stream')
-    .replace(/[\r\n]/g, '')
-    .slice(0, 200);
+  // 防注入：content-type 只参与签名，不允许换行/控制字符。
+  // 再用 resolveType 按扩展名归一：浏览器对 7z/dmg/apk/exe 等给不出 MIME，
+  // 若原样签名，R2 里存的 Content-Type 就是错的（下载时无法正确识别）。
+  const ctype = resolveType(
+    path,
+    String(body.type || '')
+      .replace(/[\r\n]/g, '')
+      .slice(0, 200)
+  );
 
   const max = parseInt(c.env.MAX_UPLOAD || '0', 10);
   if (max > 0 && (body.size ?? 0) > max) {
@@ -238,6 +257,7 @@ app.post('/api/sign', async (c) => {
       ok: true,
       url: `/api/local-put?key=${encodeURIComponent(path)}`,
       key: path,
+      ctype,
       local: true,
     });
   }
@@ -255,7 +275,8 @@ app.post('/api/sign', async (c) => {
     ctype
   );
 
-  return c.json({ ok: true, url, key: path });
+  // 回传 ctype：前端 PUT 与 commit 必须与签名用的值完全一致，否则 R2 判签名不匹配（403）
+  return c.json({ ok: true, url, key: path, ctype });
 });
 
 /** 第二步：上传成功后，把文件信息增量写入 files.json */
@@ -280,7 +301,8 @@ app.post('/api/commit', async (c) => {
     p: path,
     s: obj.size,
     t: Date.now(),
-    c: body.type || guessType(path),
+    // 与 /api/sign、/api/local-put 同一口径：保证索引里的 MIME 与对象实际存储一致
+    c: resolveType(path, body.type),
   });
 
   return c.json({ ok: true });
@@ -327,12 +349,15 @@ app.post('/api/mkdir', async (c) => {
   if (!path) return c.json({ error: '路径非法' }, 400);
 
   const prefix = path + '/';
-  const obj = await c.env.BUCKET.head(prefix);
-  if (obj) return c.json({ ok: true }); // 已存在，幂等
 
-  await c.env.BUCKET.put(prefix, new Uint8Array(0), {
-    httpMetadata: { contentType: 'application/octet-stream' },
-  });
+  // 幂等：对象已存在时也要补写一次索引条目。否则「占位对象在、索引条目丢失」
+  // （索引被清空过、或手工删过条目）时，点新建同名目录只返回 ok，目录却始终不显示。
+  if (!(await c.env.BUCKET.head(prefix))) {
+    await c.env.BUCKET.put(prefix, new Uint8Array(0), {
+      httpMetadata: { contentType: 'application/octet-stream' },
+    });
+  }
+
   await upsertFile(c.env.BUCKET, {
     p: prefix,
     s: 0,

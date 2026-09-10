@@ -762,6 +762,9 @@ function renderStats(items) {
 
 /* ---------------- README ---------------- */
 
+/** README 渲染令牌：快速切目录时，先发出的旧响应不能盖住新目录的内容 */
+let readmeSeq = 0;
+
 async function renderReadme(items) {
   const box = $('readme');
   if (!box) return;
@@ -770,14 +773,17 @@ async function renderReadme(items) {
     box.classList.add('hidden');
     return;
   }
+  const seq = ++readmeSeq;
   try {
     const res = await fetch(dlUrl(hit.p));
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
+    // 等待期间已经渲染过别的目录 → 丢弃本次结果
+    if (seq !== readmeSeq) return;
     box.innerHTML = `<div class="hd"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>README.md</div><div class="bd md">${md(text)}</div>`;
     box.classList.remove('hidden');
   } catch {
-    box.classList.add('hidden');
+    if (seq === readmeSeq) box.classList.add('hidden');
   }
 }
 
@@ -957,16 +963,20 @@ async function uploadOne(file, box, relPath) {
       const sign = await signRes.json();
       if (!signRes.ok) throw new Error(sign.error || '签名失败');
 
+      // 优先用服务端回传的 ctype：它按扩展名归一（浏览器给不出 7z/dmg/apk 的 MIME），
+      // 且 presigned 模式下就是签名用的值，必须与 PUT 头完全一致否则 403。
+      const upType = sign.ctype || type;
+
       await putFile(sign.url, file, (p) => {
         bar.style.width = Math.round(p * 100) + '%';
         st.textContent = Math.round(p * 100) + '%';
-      }, type);
+      }, upType);
 
       st.textContent = '写入索引';
       const commit = await fetch('/api/commit', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path, size: file.size, type }),
+        body: JSON.stringify({ path, size: file.size, type: upType }),
       });
       if (!commit.ok) throw new Error('索引写入失败');
 
@@ -1079,8 +1089,10 @@ function bindDrop() {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
   });
 
-  document.addEventListener('dragleave', (e) => {
-    if (!hasFiles(e)) return;
+  document.addEventListener('dragleave', () => {
+    // 这里不能判断 hasFiles：部分浏览器在 dragleave 时 dataTransfer.types 已清空，
+    // 一旦提前 return，depth 就只增不减 → 全屏遮罩永久卡住。
+    // 统一按「离开一次减一层」，drop 里再重置，保证一定能收干净。
     depth = Math.max(0, depth - 1);
     if (!depth) show(false);
   });

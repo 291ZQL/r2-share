@@ -48,9 +48,13 @@ export function sanitizePath(input: unknown): string | null {
   // 拒绝绝对路径：R2 的 key 一律是相对的，开头带 / 或 \ 说明意图可疑
   if (/^[/\\]/.test(p)) return null;
 
-  // 统一成正斜杠，去掉首尾斜杠
-  p = p.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  // 统一成正斜杠，去掉尾部斜杠
+  p = p.replace(/\\/g, '/').replace(/\/+$/, '');
   if (!p) return null;
+
+  // 索引文件是系统保留 key：绝不能通过用户接口上传/删除。
+  // 否则一次误传（本地恰好有个同名文件）就会把整个目录索引冲掉。
+  if (p === INDEX_KEY) return null;
 
   // 拒绝控制字符
   if (/[\u0000-\u001f\u007f]/.test(p)) return null;
@@ -177,55 +181,76 @@ export async function removeDir(
 export async function rebuildIndex(
   bucket: R2Bucket
 ): Promise<{ files: number }> {
-  const files: FileEntry[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ cursor, limit: 1000 });
-    for (const o of page.objects) {
-      if (o.key === INDEX_KEY) continue;
-      files.push({
-        p: o.key,
-        s: o.size,
-        t: o.uploaded.getTime(),
-        c: guessType(o.key),
-      });
-    }
-    cursor = page.truncated
-      ? (page as unknown as { cursor?: string }).cursor
-      : undefined;
-  } while (cursor);
-  await writeIndex(bucket, { updated: 0, files });
-  return { files: files.length };
+  // 与 upsert/remove 共用同一把锁：否则「重建期间恰好有上传提交」会互相覆盖，
+  // 刚写入的新文件条目会被重建结果冲掉。多 isolate 下仍无解（已知限制）。
+  return withIndexLock(async () => {
+    const files: FileEntry[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await bucket.list({ cursor, limit: 1000 });
+      for (const o of page.objects) {
+        if (o.key === INDEX_KEY) continue;
+        files.push({
+          p: o.key,
+          s: o.size,
+          t: o.uploaded.getTime(),
+          c: guessType(o.key),
+        });
+      }
+      cursor = page.truncated
+        ? (page as unknown as { cursor?: string }).cursor
+        : undefined;
+    } while (cursor);
+    await writeIndex(bucket, { updated: 0, files });
+    return { files: files.length };
+  });
 }
+
+/** 常见扩展名 → MIME（模块级常量：避免每次调用重建对象，rebuildIndex 会调用上千次） */
+const MIME_BY_EXT: Record<string, string> = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mp3: 'audio/mpeg',
+  flac: 'audio/flac',
+  wav: 'audio/wav',
+  zip: 'application/zip',
+  gz: 'application/gzip',
+  tar: 'application/x-tar',
+  '7z': 'application/x-7z-compressed',
+  txt: 'text/plain; charset=utf-8',
+  md: 'text/markdown; charset=utf-8',
+  json: 'application/json; charset=utf-8',
+  csv: 'text/csv; charset=utf-8',
+  epub: 'application/epub+zip',
+  apk: 'application/vnd.android.package-archive',
+  exe: 'application/vnd.microsoft.portable-executable',
+  dmg: 'application/x-apple-diskimage',
+};
 
 /** 常见扩展名 → MIME，猜不出来时回退到 octet-stream */
 export function guessType(filename: string): string {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  const map: Record<string, string> = {
-    pdf: 'application/pdf',
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    svg: 'image/svg+xml',
-    mp4: 'video/mp4',
-    webm: 'video/webm',
-    mp3: 'audio/mpeg',
-    flac: 'audio/flac',
-    wav: 'audio/wav',
-    zip: 'application/zip',
-    gz: 'application/gzip',
-    tar: 'application/x-tar',
-    '7z': 'application/x-7z-compressed',
-    txt: 'text/plain; charset=utf-8',
-    md: 'text/markdown; charset=utf-8',
-    json: 'application/json; charset=utf-8',
-    csv: 'text/csv; charset=utf-8',
-    epub: 'application/epub+zip',
-    apk: 'application/vnd.android.package-archive',
-    exe: 'application/vnd.microsoft.portable-executable',
-    dmg: 'application/x-apple-diskimage',
-  };
-  return map[ext] ?? 'application/octet-stream';
+  return MIME_BY_EXT[ext] ?? 'application/octet-stream';
+}
+
+/**
+ * 决定对象最终的 Content-Type：扩展名能识别时以扩展名为准，否则回退到 hint。
+ *
+ * 为什么不信浏览器给的 file.type：对 7z / dmg / apk / exe / flac / epub 等类型，
+ * 浏览器一律给空串或 octet-stream，直传后 R2 里存的 MIME 就是错的（下载无法正确识别）；
+ * 扩展名稳定可预测，且与前端预览的类型判定口径一致。
+ * hint 仅在扩展名未知时兜底（例如无扩展名的自定义格式）。
+ */
+export function resolveType(path: string, hint?: string): string {
+  const guessed = guessType(path);
+  if (guessed !== 'application/octet-stream') return guessed;
+  const h = typeof hint === 'string' ? hint.trim() : '';
+  return h || 'application/octet-stream';
 }

@@ -77,6 +77,29 @@ async function main() {
     ok(`拒绝非法路径 ${JSON.stringify(p)}`, r.status === 400, `实际 ${r.status}`);
   }
 
+  console.log('\n[索引保护]');
+  // files.json 是索引自身：若能被用户上传/删除，一次误传同名文件就会冲掉整站目录列表
+  const overwrite = await req('/api/sign', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path: 'files.json', size: 1, type: 'application/json' }),
+  });
+  ok('拒绝把索引文件当作上传目标', overwrite.status === 400, `实际 ${overwrite.status}`);
+
+  const delIdx = await req('/api/file', {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path: 'files.json' }),
+  });
+  ok('拒绝删除索引文件', delIdx.status === 400, `实际 ${delIdx.status}`);
+
+  const subIdx = await req('/api/sign', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path: '_smoke/files.json', size: 1, type: 'application/json' }),
+  });
+  ok('子目录下的同名文件不受影响', subIdx.status === 200, `实际 ${subIdx.status}`);
+
   console.log('\n[上传]');
   // 全部用 _smoke/ 前缀：与演示数据隔离，测完清理，不残留
   const files = [
