@@ -870,8 +870,15 @@ async function loadIndex() {
     const up = $('idx-updated');
     if (up && data.updated) up.textContent = '索引更新于 ' + fmtTime(data.updated);
   } catch {
-    // 拉取失败时保留上一次的索引，避免网络抖动把页面清空成「目录是空的」
-    if (state.index.length) toast('索引加载失败，当前显示的是上次结果', 'err');
+    // 拉取失败时保留上一次的索引，避免网络抖动把页面清空成「目录是空的」。
+    // 首次加载就失败时 index 为空，若静默处理，页面会显示「这个目录是空的」，
+    // 用户会误以为文件丢了——两种情形都必须给出反馈。
+    toast(
+      state.index.length
+        ? '索引加载失败，当前显示的是上次结果'
+        : '索引加载失败，请刷新重试',
+      'err'
+    );
   }
   render();
 }
@@ -921,6 +928,10 @@ async function uploadFiles(list) {
 
   // 每个文件一行独立进度，失败行保留并给出重试按钮
   await pool(items, 4, (item) => uploadOne(item.file, box, item.path));
+
+  // 成功的行会自行移除，容器此时可能已经空了。空容器有 1px 边框，会在页面上
+  // 留一条细线，所以收干净；只有存在失败行（带重试按钮）时才继续显示。
+  if (!box.children.length) box.classList.add('hidden');
 
   await loadIndex();
 }

@@ -8,6 +8,7 @@
  *   2. resolveType  —— MIME 归一：扩展名优先、hint 兜底
  */
 
+import fs from 'node:fs';
 import { sanitizePath, resolveType, guessType } from '../src/store.ts';
 
 let pass = 0;
@@ -91,6 +92,63 @@ eq('jpeg 与 jpg 同值', guessType('x.jpeg'), guessType('x.jpg'));
 eq('未知扩展名', guessType('x.zzz'), 'application/octet-stream');
 eq('无扩展名', guessType('Makefile'), 'application/octet-stream');
 eq('路径带目录也能取扩展名', guessType('a/b/c.pdf'), 'application/pdf');
+
+/* ============ 补表后的常见类型 ============
+ * 这些扩展名浏览器给不出可靠 MIME（空串或 octet-stream），必须由扩展名表负责。
+ */
+group('resolveType 补全的常见类型');
+eq('js', resolveType('app.js'), 'text/javascript; charset=utf-8');
+eq('mjs', resolveType('a.mjs'), 'text/javascript; charset=utf-8');
+eq('ts', resolveType('a.ts'), 'text/typescript; charset=utf-8');
+eq('css', resolveType('style.css'), 'text/css; charset=utf-8');
+eq('html', resolveType('index.html'), 'text/html; charset=utf-8');
+eq('py', resolveType('a.py'), 'text/x-python; charset=utf-8');
+eq('sh', resolveType('a.sh'), 'text/x-shellscript; charset=utf-8');
+eq('yaml', resolveType('a.yml'), 'text/yaml; charset=utf-8');
+eq('toml', resolveType('a.toml'), 'text/plain; charset=utf-8');
+eq('xml', resolveType('a.xml'), 'text/xml; charset=utf-8');
+eq('docx', resolveType('a.docx'), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+eq('xlsx', resolveType('a.xlsx'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+eq('pptx', resolveType('a.pptx'), 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
+eq('doc', resolveType('a.doc'), 'application/msword');
+eq('rar', resolveType('a.rar'), 'application/vnd.rar');
+eq('tgz', resolveType('a.tgz'), 'application/gzip');
+eq('xz', resolveType('a.xz'), 'application/x-xz');
+eq('bz2', resolveType('a.bz2'), 'application/x-bzip2');
+eq('mkv', resolveType('a.mkv'), 'video/x-matroska');
+eq('mov', resolveType('a.mov'), 'video/quicktime');
+eq('aac', resolveType('a.aac'), 'audio/aac');
+eq('m4a', resolveType('a.m4a'), 'audio/mp4');
+eq('bmp', resolveType('a.bmp'), 'image/bmp');
+eq('ico', resolveType('a.ico'), 'image/x-icon');
+eq('mobi', resolveType('a.mobi'), 'application/x-mobipocket-ebook');
+
+/* ============ 前后端类型表对齐（防再次漂移）============
+ * 前端 app.js 用来判断「能不能预览 / 显示什么图标」的扩展名，
+ * 服务端必须都能给出真实 MIME —— 否则 resolveType 只能退回浏览器 hint，
+ * 而 rebuildIndex 完全没有 hint，索引里的 c 会一律退化成 octet-stream。
+ * 这条断言把「两张表必须对齐」钉成可回归的约束。
+ */
+group('前端识别表 ⊆ 服务端 MIME 表');
+const appJs = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+const frontExts = new Set();
+for (const re of [
+  /const EXT_KIND = \{([\s\S]*?)\n\};/,
+  /const TEXT_EXT = new Set\(\[([\s\S]*?)\]\);/,
+  /const OFFICE_EXT = new Set\(\[([\s\S]*?)\]\);/,
+]) {
+  const block = appJs.match(re);
+  if (!block) {
+    console.error(`✗ 无法从 app.js 提取类型表，正则失配：${re}`);
+    process.exit(1);
+  }
+  for (const m of block[1].matchAll(/'([\w]+)'/g)) frontExts.add(m[1].toLowerCase());
+}
+eq('前端扩展名数量合理（>80）', frontExts.size > 80, true);
+const uncovered = [...frontExts]
+  .filter((e) => guessType('x.' + e) === 'application/octet-stream')
+  .sort();
+eq('前端识别的扩展名服务端全部覆盖', uncovered, []);
 
 console.log(`\n结果：${pass} 通过，${fail} 失败\n`);
 process.exit(fail ? 1 : 0);

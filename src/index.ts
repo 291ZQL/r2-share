@@ -2,9 +2,10 @@
  * r2share —— 零费用的 R2 我的仓库
  *
  * 请求消耗模型（核心设计）：
- *   浏览目录页 : 0 次 Worker（静态资源免费无限）+ 1 次 R2 读 files.json
+ *   浏览目录页 : 1 次 Worker（动态渲染 HTML，用于注入登录态）+ 1 次 R2 读 files.json
+ *                style.css / app.js 等静态资源由 CF 边缘直接服务，0 次 Worker
  *   下载文件   : 0 次 Worker（R2 公开桶直链，出口免费）
- *   上传文件   : 2 次 Worker（签名 + 提交索引），数据不过 Worker
+ *   上传文件   : 3 次 Worker（签名 + 代理写入 + 提交索引），数据经 Worker 中转
  */
 
 import { Hono } from 'hono';
@@ -297,12 +298,21 @@ app.post('/api/commit', async (c) => {
   const obj = await c.env.BUCKET.head(path);
   if (!obj) return c.json({ error: '对象不存在，请先上传' }, 404);
 
+  // content-type 与 /api/sign 同款清洗：扩展名不可识别时 type 会被原样写进索引，
+  // 必须过滤换行/控制字符并限长，两个接口的入口校验口径保持一致
+  const ctype = resolveType(
+    path,
+    String(body.type || '')
+      .replace(/[\r\n]/g, '')
+      .slice(0, 200)
+  );
+
   await upsertFile(c.env.BUCKET, {
     p: path,
     s: obj.size,
     t: Date.now(),
     // 与 /api/sign、/api/local-put 同一口径：保证索引里的 MIME 与对象实际存储一致
-    c: resolveType(path, body.type),
+    c: ctype,
   });
 
   return c.json({ ok: true });

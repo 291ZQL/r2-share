@@ -149,16 +149,19 @@ export async function removeDir(
       const keys = page.objects.map((o) => o.key);
       if (keys.length) {
         await bucket.delete(keys);
-        // 占位对象（key === prefix）不计入文件数，否则空目录会显示「含 1 个文件」
-        n += keys.filter((k) => k !== prefix).length;
+        // 目录占位对象的 key 一律以 / 结尾（<dir>/ 的 0 字节对象），不计入文件数。
+        // 只排除 key === prefix 是不够的：嵌套子目录（_vf/sub/）的占位对象会被漏掉，
+        // 让「已删除（含 N 个文件）」把子目录也算成文件。
+        n += keys.filter((k) => !k.endsWith('/')).length;
       }
       cursor = page.truncated
         ? (page as unknown as { cursor?: string }).cursor
         : undefined;
     } while (cursor);
 
-    // 占位对象（新建目录时创建的 <dir>/ 0 字节对象）
-    await bucket.delete(prefix);
+    // 占位对象（新建目录时创建的 <dir>/ 0 字节对象）已随上面的循环一并删除：
+    // list({prefix}) 是前缀匹配，key 恰好等于 prefix 的对象也在返回结果里
+    // （计数处的 filter(k => k !== prefix) 正是把它排除掉），无需再删一次。
 
     const index = await readIndex(bucket);
     const next = index.files.filter(
@@ -206,32 +209,131 @@ export async function rebuildIndex(
   });
 }
 
-/** 常见扩展名 → MIME（模块级常量：避免每次调用重建对象，rebuildIndex 会调用上千次） */
+/**
+ * 常见扩展名 → MIME（模块级常量：避免每次调用重建对象，rebuildIndex 会调用上千次）
+ *
+ * 覆盖面要与前端 public/app.js 的类型判定表（EXT_KIND / TEXT_EXT / OFFICE_EXT）对齐：
+ * 表里查不到的扩展名，resolveType 只能回退到浏览器的 hint，而浏览器对 7z/rar/mkv
+ * 这类格式常给空串或 octet-stream，落库的 Content-Type 就是错的；rebuildIndex 更是
+ * 没有 hint 可用（只有扩展名），查不到会一律退化成 octet-stream。
+ */
 const MIME_BY_EXT: Record<string, string> = {
-  pdf: 'application/pdf',
+  /* 图片 */
   png: 'image/png',
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
   gif: 'image/gif',
   webp: 'image/webp',
+  bmp: 'image/bmp',
+  ico: 'image/x-icon',
   svg: 'image/svg+xml',
+  /* 视频 */
   mp4: 'video/mp4',
   webm: 'video/webm',
+  mkv: 'video/x-matroska',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  flv: 'video/x-flv',
+  /* 音频 */
   mp3: 'audio/mpeg',
   flac: 'audio/flac',
   wav: 'audio/wav',
+  aac: 'audio/aac',
+  ogg: 'audio/ogg',
+  m4a: 'audio/mp4',
+  /* 压缩包 */
   zip: 'application/zip',
-  gz: 'application/gzip',
-  tar: 'application/x-tar',
+  rar: 'application/vnd.rar',
   '7z': 'application/x-7z-compressed',
-  txt: 'text/plain; charset=utf-8',
-  md: 'text/markdown; charset=utf-8',
-  json: 'application/json; charset=utf-8',
-  csv: 'text/csv; charset=utf-8',
+  gz: 'application/gzip',
+  tgz: 'application/gzip',
+  bz2: 'application/x-bzip2',
+  xz: 'application/x-xz',
+  tar: 'application/x-tar',
+  /* 文档 */
+  pdf: 'application/pdf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   epub: 'application/epub+zip',
+  mobi: 'application/x-mobipocket-ebook',
   apk: 'application/vnd.android.package-archive',
   exe: 'application/vnd.microsoft.portable-executable',
   dmg: 'application/x-apple-diskimage',
+  /* 文本 / 数据 */
+  txt: 'text/plain; charset=utf-8',
+  text: 'text/plain; charset=utf-8',
+  log: 'text/plain; charset=utf-8',
+  md: 'text/markdown; charset=utf-8',
+  json: 'application/json; charset=utf-8',
+  csv: 'text/csv; charset=utf-8',
+  tsv: 'text/tab-separated-values; charset=utf-8',
+  xml: 'text/xml; charset=utf-8',
+  xhtml: 'application/xhtml+xml; charset=utf-8',
+  yaml: 'text/yaml; charset=utf-8',
+  yml: 'text/yaml; charset=utf-8',
+  toml: 'text/plain; charset=utf-8',
+  ini: 'text/plain; charset=utf-8',
+  cfg: 'text/plain; charset=utf-8',
+  conf: 'text/plain; charset=utf-8',
+  env: 'text/plain; charset=utf-8',
+  properties: 'text/plain; charset=utf-8',
+  sql: 'text/x-sql; charset=utf-8',
+  diff: 'text/x-diff; charset=utf-8',
+  patch: 'text/x-diff; charset=utf-8',
+  nfo: 'text/plain; charset=utf-8',
+  readme: 'text/plain; charset=utf-8',
+  license: 'text/plain; charset=utf-8',
+  gitignore: 'text/plain; charset=utf-8',
+  gitattributes: 'text/plain; charset=utf-8',
+  editorconfig: 'text/plain; charset=utf-8',
+  dockerfile: 'text/plain; charset=utf-8',
+  cmake: 'text/plain; charset=utf-8',
+  gradle: 'text/plain; charset=utf-8',
+  /* 代码 */
+  js: 'text/javascript; charset=utf-8',
+  mjs: 'text/javascript; charset=utf-8',
+  cjs: 'text/javascript; charset=utf-8',
+  jsx: 'text/jsx; charset=utf-8',
+  ts: 'text/typescript; charset=utf-8',
+  tsx: 'text/tsx; charset=utf-8',
+  css: 'text/css; charset=utf-8',
+  scss: 'text/x-scss; charset=utf-8',
+  sass: 'text/x-sass; charset=utf-8',
+  less: 'text/less; charset=utf-8',
+  html: 'text/html; charset=utf-8',
+  htm: 'text/html; charset=utf-8',
+  vue: 'text/plain; charset=utf-8',
+  svelte: 'text/plain; charset=utf-8',
+  py: 'text/x-python; charset=utf-8',
+  pyw: 'text/x-python; charset=utf-8',
+  go: 'text/x-go; charset=utf-8',
+  rs: 'text/x-rust; charset=utf-8',
+  java: 'text/x-java; charset=utf-8',
+  kt: 'text/plain; charset=utf-8',
+  scala: 'text/plain; charset=utf-8',
+  swift: 'text/plain; charset=utf-8',
+  dart: 'text/plain; charset=utf-8',
+  c: 'text/x-c; charset=utf-8',
+  h: 'text/x-c; charset=utf-8',
+  cc: 'text/x-c; charset=utf-8',
+  cpp: 'text/x-c; charset=utf-8',
+  hpp: 'text/x-c; charset=utf-8',
+  cs: 'text/plain; charset=utf-8',
+  m: 'text/x-c; charset=utf-8',
+  mm: 'text/x-c; charset=utf-8',
+  php: 'text/x-php; charset=utf-8',
+  rb: 'text/x-ruby; charset=utf-8',
+  pl: 'text/x-perl; charset=utf-8',
+  lua: 'text/x-lua; charset=utf-8',
+  r: 'text/plain; charset=utf-8',
+  sh: 'text/x-shellscript; charset=utf-8',
+  bat: 'text/plain; charset=utf-8',
+  cmd: 'text/plain; charset=utf-8',
+  ps1: 'text/plain; charset=utf-8',
 };
 
 /** 常见扩展名 → MIME，猜不出来时回退到 octet-stream */

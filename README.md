@@ -9,19 +9,19 @@
 ## 界面预览
 
 未登录列表视图（默认）：
-![home](.ui-home.png)
+![home](docs/screenshots/home.png)
 
 未登录网格视图：
-![grid](.ui-grid.png)
+![grid](docs/screenshots/grid.png)
 
 登录后顶部多出「重建索引 / 上传 / 退出」三个按钮，文件行 hover 出现删除按钮：
-![login](.ui-login.png)
+![login](docs/screenshots/login.png)
 
 README.md 预览弹层（标题右侧「下载」按钮直链下载）：
-![preview](.ui-preview.png)
+![preview](docs/screenshots/preview.png)
 
 搜索无结果时的空态（与「目录为空」文案分开）：
-![search-empty](.ui-search-empty.png)
+![search-empty](docs/screenshots/search-empty.png)
 
 ---
 
@@ -258,8 +258,8 @@ cp .dev.vars.example .dev.vars             # 按需改口令
 cp .deploy.local.example.json .deploy.local.json   # 填真实 KV id（见第 3 步）
 npm run dev                      # http://127.0.0.1:8787
 node scripts/seed.mjs            # 灌入演示数据
-node scripts/smoke.mjs           # 跑全流程冒烟测试（32 项）
-node scripts/test-crypto.mjs     # AWS SigV4 签名 vs 官方向量对拍
+node scripts/smoke.mjs           # 跑全流程冒烟测试（35 项）
+npm test                         # 单元测试：SigV4 签名向量 / 路径与 MIME / 预览分类
 npm run check                    # 部署前自检
 ```
 
@@ -269,7 +269,8 @@ npm run check                    # 部署前自检
 NODE_PATH="<playwright-core 所在 node_modules 目录>" node e2e-prod.mjs
 ```
 
-脚本内 `BASE` / `PASS` 按生产环境修改；依赖外部 playwright-core（不在本项目 package.json）。
+注：该脚本是本地自用工具，已被 `.gitignore` 排除、**不在仓库中分发**，运行需自备外部
+playwright-core；脚本内 `BASE` / `PASS` 按生产环境修改。
 
 ### 同步源码到 GitHub
 
@@ -280,7 +281,8 @@ npm run push:gh -- src/index.ts public/app.js   # 只同步指定文件
 ```
 
 > 为什么不是 `git push`：本仓库的开发环境代理只放行 `api.github.com`、拦截 `github.com`，
-> git 协议必然超时。脚本改走 **GitHub Contents API** 逐文件 PUT，效果等价。
+> git 协议必然超时。脚本改走 **GitHub Git Data API**：把所有文件塞进同一个 tree/commit
+> 一次性推送，效果等价，且**一次同步只产生一个 commit、只触发一次 CI**。
 > 在正常网络下直接 `git push` 即可，无需用这个脚本。
 >
 > 脚本只同步 **git 已跟踪**的文件，因此 `.dev.vars` / `.deploy.local.json` 天然不会上传。
