@@ -3,7 +3,6 @@
 # 前置条件 — 在仓库 Settings → Secrets and variables → Actions 配置：
 #   CLOUDFLARE_API_TOKEN   带 Workers Scripts Edit + R2 权限的 API Token
 #   CLOUDFLARE_ACCOUNT_ID  账户 id（32 位十六进制）
-#   KV_ID                  账户下 KV namespace r2share_kv 的 id（wrangler.toml 里是占位符）
 #   ADMIN_PASSWORD        管理口令（同步为 Worker secret）
 #   SESSION_SECRET         会话签名密钥（同步为 Worker secret）
 #   R2_ACCESS_KEY_ID       R2 S3 API 令牌（同步为 Worker secret）
@@ -45,12 +44,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # npm run deploy 内部 = npm run check && node scripts/with-config.mjs deploy
-      # KV_ID 走环境变量注入占位符（local-config.mjs 原生支持），CI 无需 .deploy.local.json
+      # npm run deploy 内部 = npm run check && wrangler deploy
       - name: Deploy Worker
         run: npm run deploy
         env:
-          KV_ID: ${{ secrets.KV_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 

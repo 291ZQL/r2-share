@@ -5,7 +5,8 @@
  *   浏览目录页 : 1 次 Worker（动态渲染 HTML，用于注入登录态）+ 1 次 R2 读 files.json
  *                style.css / app.js 等静态资源由 CF 边缘直接服务，0 次 Worker
  *   下载文件   : 0 次 Worker（R2 公开桶直链，出口免费）
- *   上传文件   : 3 次 Worker（签名 + 代理写入 + 提交索引），数据经 Worker 中转
+ *   上传文件   : 数据经 Worker 中转；索引提交按「整批」合并——
+ *                1 次批量签名 + N 次写入 + 1 次批量提交（单个文件是 3 次）
  */
 
 import { Hono } from 'hono';
@@ -20,17 +21,19 @@ import {
 } from './auth';
 import {
   sanitizePath,
-  upsertFile,
+  IndexConflictError,
+  upsertFiles,
   removeFile,
+  removeFiles,
   removeDir,
   rebuildIndex,
   readIndex,
   resolveType,
+  type FileEntry,
 } from './store';
 
 export interface Env {
   BUCKET: R2Bucket;
-  KV: KVNamespace;
   ASSETS: Fetcher;
   DL_DOMAIN: string;
   SITE_NAME: string;
@@ -48,6 +51,24 @@ export interface Env {
 
 const app = new Hono<{ Bindings: Env }>();
 
+/**
+ * 索引条件写连续冲突（极端并发）时返回 409 而不是 500：
+ * 这不是服务端故障——对象已经写进桶，只是没进索引（点一次「重建索引」即可对齐），
+ * 前端据此提示「稍后重试」。其余异常照旧记日志并返回 500。
+ */
+app.onError((err, c) => {
+  if (err instanceof IndexConflictError) {
+    return c.json({ error: '索引正被其他请求修改，请稍后重试' }, 409);
+  }
+  console.error('[r2share] 未处理异常:', err);
+  return c.text('Internal Server Error', 500);
+});
+
+/** 单次批量提交索引的条目上限 */
+const MAX_COMMIT_BATCH = 1000;
+/** 单次批量删除的文件数上限（R2 单次 delete 也是 1000 个 key 一批） */
+const MAX_DELETE_BATCH = 1000;
+
 /** 判断当前请求是否已登录 */
 async function isLogin(c: any): Promise<boolean> {
   const secret = c.env.SESSION_SECRET;
@@ -55,20 +76,69 @@ async function isLogin(c: any): Promise<boolean> {
   return verifySession(secret, getCookie(c, SESSION_COOKIE));
 }
 
-/** 登录失败计数：15 分钟内超过 10 次则临时锁定 */
-async function failCount(c: any, ip: string, reset = false): Promise<number> {
-  const key = `login_fail:${ip}`;
-  if (reset) {
-    await c.env.KV.delete(key);
+/* ---------------- 登录失败限流 ----------------
+ * 用模块级 Map 而不是 KV：
+ *   - KV 免费版「同一个 key 每秒只能写 1 次」且「每天 1000 次写」。爆破时同一 IP
+ *     的连续写会失败，计数也就跟着失真，甚至把登录接口打成 500。
+ *   - 内存计数零额度、零往返，登录路径顺带少一次 KV 读，响应更快。
+ * 代价：isolate 之间不共享计数，多 isolate 下限流会被稀释。这是有意的取舍——
+ * 限流只负责挡住「慢慢猜口令」这种高频尝试，真正的防线是 ADMIN_PASSWORD 本身。
+ */
+const FAIL_WINDOW_MS = 15 * 60_000;
+const FAIL_MAX = 10;
+/** 计数表容量上限：防止攻击者用海量不同 IP 撑爆 isolate 的 128MB 内存 */
+const FAIL_KEYS_MAX = 5000;
+
+const failTable = new Map<string, { n: number; until: number }>();
+
+/** 当前 IP 在窗口内的失败次数（顺手清掉已过期的那条） */
+function failCountOf(ip: string): number {
+  const rec = failTable.get(ip);
+  if (!rec) return 0;
+  if (rec.until <= Date.now()) {
+    failTable.delete(ip);
     return 0;
   }
-  const cur = parseInt((await c.env.KV.get(key)) ?? '0', 10) || 0;
-  const next = cur + 1;
-  await c.env.KV.put(key, String(next), { expirationTtl: 900 });
-  return next;
+  return rec.n;
+}
+
+/** 记一次失败，返回累计次数 */
+function markFail(ip: string): number {
+  const now = Date.now();
+  const rec = failTable.get(ip);
+  const n = rec && rec.until > now ? rec.n + 1 : 1;
+  failTable.set(ip, { n, until: now + FAIL_WINDOW_MS });
+  if (failTable.size > FAIL_KEYS_MAX) sweepFails(now);
+  return n;
+}
+
+/** 登录成功后清空该 IP 的失败计数 */
+function clearFail(ip: string): void {
+  failTable.delete(ip);
+}
+
+/** 容量超限时先清过期项，再按插入顺序淘汰最早的，保证内存有界 */
+function sweepFails(now: number): void {
+  for (const [k, v] of failTable) {
+    if (v.until <= now) failTable.delete(k);
+  }
+  while (failTable.size > FAIL_KEYS_MAX) {
+    const k = failTable.keys().next().value;
+    if (k === undefined) break;
+    failTable.delete(k);
+  }
+}
+
+/** 清洗前端传来的 MIME：去掉换行/控制字符并限长（/api/sign 与 /api/commit 口径一致） */
+function cleanType(t: unknown): string {
+  return String(t || '')
+    .replace(/[\r\n]/g, '')
+    .slice(0, 200);
 }
 
 function clientIP(c: any): string {
+  // CF 边缘一定会设置 cf-connecting-ip；x-forwarded-for 只在本地 dev 等
+  // 非 CF 环境下才可能命中，作为兜底保留但不作为生产判据
   return (
     c.req.header('cf-connecting-ip') ||
     c.req.header('x-forwarded-for') ||
@@ -150,6 +220,7 @@ app.put('/api/local-put', async (c) => {
 
   // 显式校验大小：/api/sign 校验的是前端「声明」的 size，实际 PUT 的 body 可以更大。
   // 这里按 content-length 兜一道，让超限请求在入口就被拒，而不是打到 R2 才失败。
+  // （CF 会在请求到达 Worker 前补齐并校验 Content-Length，伪造值会被边缘直接拒绝）
   const max = parseInt(c.env.MAX_UPLOAD || '0', 10);
   const len = parseInt(c.req.header('content-length') || '0', 10) || 0;
   if (max > 0 && len > max) {
@@ -181,8 +252,8 @@ app.put('/api/local-put', async (c) => {
 
 app.post('/api/login', async (c) => {
   const ip = clientIP(c);
-  const used = parseInt((await c.env.KV.get(`login_fail:${ip}`)) ?? '0', 10) || 0;
-  if (used >= 10) {
+  // 已锁定的 IP 直接拒绝，连口令校验都不做，避免继续消耗 CPU
+  if (failCountOf(ip) >= FAIL_MAX) {
     return c.json({ ok: false, error: '尝试次数过多，请 15 分钟后再试' }, 429);
   }
 
@@ -195,11 +266,11 @@ app.post('/api/login', async (c) => {
 
   const expected = c.env.ADMIN_PASSWORD;
   if (!expected || !(await checkPassword(password ?? '', expected))) {
-    await failCount(c, ip);
+    markFail(ip);
     return c.json({ ok: false, error: '口令错误' }, 401);
   }
 
-  await failCount(c, ip, true);
+  clearFail(ip);
   const days = parseInt(c.env.SESSION_DAYS || '30', 10) || 30;
   const token = await createSession(c.env.SESSION_SECRET, days);
   const secure = new URL(c.req.url).protocol === 'https:';
@@ -221,104 +292,145 @@ app.post('/api/logout', (c) => {
 
 /* ---------------- 上传：签名 + 提交 ---------------- */
 
-/** 第一步：签发 presigned PUT URL，浏览器拿到后直传 R2 */
+/**
+ * 第一步：签发上传目标地址。
+ *
+ * 两种请求形态：
+ *   { path, size, type }                    单条（响应 url/key/ctype，兼容旧调用）
+ *   { entries: [{ path, size, type }, ...] } 批量（响应 items[]，批量上传时用）
+ *
+ * 批量形态把「一次文件一次签名」压成一次请求：拖入 200 个文件时，
+ * Worker 请求数从 200 降到 1（代理模式下签名本身几乎零成本）。
+ */
 app.post('/api/sign', async (c) => {
   if (!(await isLogin(c))) return c.json({ error: '未登录' }, 401);
 
-  let body: { path?: string; size?: number; type?: string };
+  let body: { path?: string; size?: number; type?: string; entries?: unknown };
   try {
     body = (await c.req.json()) as typeof body;
   } catch {
     return c.json({ error: '请求格式错误' }, 400);
   }
 
-  const path = sanitizePath(body.path);
-  if (!path) return c.json({ error: '路径非法' }, 400);
-
-  // 防注入：content-type 只参与签名，不允许换行/控制字符。
-  // 再用 resolveType 按扩展名归一：浏览器对 7z/dmg/apk/exe 等给不出 MIME，
-  // 若原样签名，R2 里存的 Content-Type 就是错的（下载时无法正确识别）。
-  const ctype = resolveType(
-    path,
-    String(body.type || '')
-      .replace(/[\r\n]/g, '')
-      .slice(0, 200)
-  );
+  const batch = Array.isArray(body.entries);
+  const raw = batch ? (body.entries as unknown[]) : [body];
+  if (!raw.length) return c.json({ error: '没有要上传的文件' }, 400);
+  if (raw.length > MAX_COMMIT_BATCH) {
+    return c.json({ error: `一次最多上传 ${MAX_COMMIT_BATCH} 个文件` }, 413);
+  }
 
   const max = parseInt(c.env.MAX_UPLOAD || '0', 10);
-  if (max > 0 && (body.size ?? 0) > max) {
-    return c.json({ error: '文件超过大小上限' }, 413);
+  const jobs: { path: string; ctype: string }[] = [];
+  for (const it of raw) {
+    const item = it as { path?: string; size?: number; type?: string };
+    const path = sanitizePath(item.path);
+    if (!path) return c.json({ error: '路径非法' }, 400);
+    if (max > 0 && (item.size ?? 0) > max) {
+      return c.json(
+        { error: `文件超过大小上限（${Math.floor(max / 1048576)}MB）：${path}` },
+        413
+      );
+    }
+    // 防注入 + 按扩展名归一：content-type 只参与签名，不允许换行/控制字符；
+    // 浏览器对 7z/dmg/apk/exe 给不出 MIME，原样签名会让 R2 存下错误的 Content-Type
+    jobs.push({ path, ctype: resolveType(path, cleanType(item.type)) });
   }
 
   // 上传走 Worker 代理：本地开发或生产开启 UPLOAD_VIA_WORKER=1。
   // 生产场景为避免 r2.cloudflarestorage.com 被墙（ERR_ADDRESS_UNREACHABLE），
   // 上传目标改为本 Worker 的同源 /api/local-put（浏览器无需 CORS、不依赖被墙端点）。
   if (isUploadProxy(c)) {
-    return c.json({
-      ok: true,
+    const items = jobs.map(({ path, ctype }) => ({
+      path,
       url: `/api/local-put?key=${encodeURIComponent(path)}`,
-      key: path,
       ctype,
-      local: true,
-    });
+    }));
+    if (!batch) {
+      return c.json({ ok: true, url: items[0].url, key: items[0].path, ctype: items[0].ctype, local: true });
+    }
+    return c.json({ ok: true, items, local: true });
   }
 
-  const url = await presignPut(
-    {
-      accessKeyId: c.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: c.env.R2_SECRET_ACCESS_KEY,
-      accountId: c.env.R2_ACCOUNT_ID,
-      bucket: c.env.BUCKET_NAME,
-    },
-    path,
-    3600,
-    new Date(),
-    ctype
+  const cred = {
+    accessKeyId: c.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: c.env.R2_SECRET_ACCESS_KEY,
+    accountId: c.env.R2_ACCOUNT_ID,
+    bucket: c.env.BUCKET_NAME,
+  };
+  const items = await Promise.all(
+    jobs.map(async ({ path, ctype }) => ({
+      path,
+      // 回传 ctype：前端 PUT 与 commit 必须与签名用的值完全一致，否则 R2 判签名不匹配（403）
+      ctype,
+      url: await presignPut(cred, path, 3600, new Date(), ctype),
+    }))
   );
-
-  // 回传 ctype：前端 PUT 与 commit 必须与签名用的值完全一致，否则 R2 判签名不匹配（403）
-  return c.json({ ok: true, url, key: path, ctype });
+  if (!batch) {
+    return c.json({ ok: true, url: items[0].url, key: items[0].path, ctype: items[0].ctype });
+  }
+  return c.json({ ok: true, items });
 });
 
-/** 第二步：上传成功后，把文件信息增量写入 files.json */
+/**
+ * 第二步：上传成功后，把文件信息增量写入 files.json。
+ *
+ * 两种请求形态：
+ *   { path, type }                          单条（兼容旧调用）
+ *   { entries: [{ path, type }, ...] }       批量（响应含写入的 entries 供前端增量更新）
+ *
+ * 批量提交把 N 次「读索引 → 改 → 写索引」压成 1 次，这是上传链路里最贵的一环。
+ */
 app.post('/api/commit', async (c) => {
   if (!(await isLogin(c))) return c.json({ error: '未登录' }, 401);
 
-  let body: { path?: string; size?: number; type?: string };
+  let body: { path?: string; type?: string; entries?: unknown };
   try {
     body = (await c.req.json()) as typeof body;
   } catch {
     return c.json({ error: '请求格式错误' }, 400);
   }
 
-  const path = sanitizePath(body.path);
-  if (!path) return c.json({ error: '路径非法' }, 400);
+  const batch = Array.isArray(body.entries);
+  const raw = batch ? (body.entries as unknown[]) : [body];
+  if (!raw.length) return c.json({ error: '没有要提交的文件' }, 400);
+  if (raw.length > MAX_COMMIT_BATCH) {
+    return c.json({ error: `一次最多提交 ${MAX_COMMIT_BATCH} 个文件` }, 413);
+  }
 
-  // 校验对象真实存在，以桶里的实际大小为准（防止伪造 commit 污染索引）
-  const obj = await c.env.BUCKET.head(path);
-  if (!obj) return c.json({ error: '对象不存在，请先上传' }, 404);
+  const paths: string[] = [];
+  for (const it of raw) {
+    const path = sanitizePath((it as { path?: string }).path);
+    if (!path) return c.json({ error: '路径非法' }, 400);
+    paths.push(path);
+  }
 
-  // content-type 与 /api/sign 同款清洗：扩展名不可识别时 type 会被原样写进索引，
-  // 必须过滤换行/控制字符并限长，两个接口的入口校验口径保持一致
-  const ctype = resolveType(
-    path,
-    String(body.type || '')
-      .replace(/[\r\n]/g, '')
-      .slice(0, 200)
-  );
+  // 校验对象真实存在，以桶里的实际大小为准（防止伪造 commit 污染索引）。
+  // 并行 head：串行会把批量提交拖成 N 个往返，正好抵消批量化的收益。
+  const heads = await Promise.all(paths.map((p) => c.env.BUCKET.head(p)));
 
-  await upsertFile(c.env.BUCKET, {
-    p: path,
-    s: obj.size,
-    t: Date.now(),
-    // 与 /api/sign、/api/local-put 同一口径：保证索引里的 MIME 与对象实际存储一致
-    c: ctype,
-  });
+  const items: FileEntry[] = [];
+  const missing: string[] = [];
+  const now = Date.now();
+  for (let i = 0; i < paths.length; i++) {
+    const obj = heads[i];
+    if (!obj) {
+      missing.push(paths[i]);
+      continue;
+    }
+    items.push({
+      p: paths[i],
+      s: obj.size,
+      t: now,
+      // 与 /api/sign、/api/local-put 同一口径：保证索引里的 MIME 与对象实际存储一致
+      c: resolveType(paths[i], cleanType((raw[i] as { type?: string }).type)),
+    });
+  }
 
-  return c.json({ ok: true });
+  if (items.length) await upsertFiles(c.env.BUCKET, items);
+  return c.json({ ok: missing.length === 0, count: items.length, entries: items, missing });
 });
 
-/** 删除文件：删对象 + 从索引移除 */
+/** 删除单个文件：删对象 + 从索引移除 */
 app.delete('/api/file', async (c) => {
   if (!(await isLogin(c))) return c.json({ error: '未登录' }, 401);
 
@@ -335,6 +447,41 @@ app.delete('/api/file', async (c) => {
   await c.env.BUCKET.delete(path);
   await removeFile(c.env.BUCKET, path);
   return c.json({ ok: true });
+});
+
+/**
+ * 批量删除文件：一次请求删掉多个对象 + 一次索引读写。
+ * 前端批量删除原本是逐个串行调用 /api/file，删 100 个就是 100 次 Worker
+ * 和 100 次索引读改写；合并成一次后只剩 1 次请求 + 1 次索引写。
+ */
+app.delete('/api/files', async (c) => {
+  if (!(await isLogin(c))) return c.json({ error: '未登录' }, 401);
+
+  let body: { paths?: unknown };
+  try {
+    body = (await c.req.json()) as typeof body;
+  } catch {
+    return c.json({ error: '请求格式错误' }, 400);
+  }
+
+  const raw = Array.isArray(body.paths) ? body.paths : [];
+  const paths: string[] = [];
+  for (const p of raw) {
+    const s = sanitizePath(p);
+    if (!s) return c.json({ error: '路径非法' }, 400);
+    paths.push(s);
+  }
+  if (!paths.length) return c.json({ error: '没有要删除的文件' }, 400);
+  if (paths.length > MAX_DELETE_BATCH) {
+    return c.json({ error: `一次最多删除 ${MAX_DELETE_BATCH} 个文件` }, 413);
+  }
+
+  // R2 的 delete 单次最多 1000 个 key，按上限分批（正常一批就够）
+  for (let i = 0; i < paths.length; i += 1000) {
+    await c.env.BUCKET.delete(paths.slice(i, i + 1000));
+  }
+  const removed = await removeFiles(c.env.BUCKET, paths);
+  return c.json({ ok: true, removed, requested: paths.length });
 });
 
 /* ---------------- 目录：新建 + 删除 ---------------- */
@@ -368,12 +515,14 @@ app.post('/api/mkdir', async (c) => {
     });
   }
 
-  await upsertFile(c.env.BUCKET, {
-    p: prefix,
-    s: 0,
-    t: Date.now(),
-    c: 'application/octet-stream',
-  });
+  await upsertFiles(c.env.BUCKET, [
+    {
+      p: prefix,
+      s: 0,
+      t: Date.now(),
+      c: 'application/octet-stream',
+    },
+  ]);
   return c.json({ ok: true });
 });
 

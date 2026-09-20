@@ -16,7 +16,7 @@
 #
 # 说明：
 #   - 未列出的远端文件由 base_tree 自动继承，不会被删除
-#   - 只同步 git 已跟踪的文件，.gitignore 排除的（.dev.vars / .deploy.local.json）天然不会上传
+#   - 只同步 git 已跟踪的文件，.gitignore 排除的（.dev.vars 等）天然不会上传
 #
 set -u
 cd "$(dirname "$0")/.."

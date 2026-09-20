@@ -5,14 +5,18 @@ compatibility_date = "2026-08-01"
 
 # 静态资源（style.css / app.js）
 # 注意：静态资源请求由 CF 边缘直接服务，免费且无上限，不消耗 Workers 请求数。
-# run_worker_first 只对 /api/* 生效：API 先执行 Worker；其余请求（首页 / 与静态资源）
-# 不执行 Worker → 页面加载的 Workers 消耗从「1 HTML + 1 css + 1 js = 3 次」降到 1 次，
+# run_worker_first 命中时 API 与首页先执行 Worker，其余静态资源不执行 Worker →
+# 页面加载的 Workers 消耗从「1 HTML + 1 css + 1 js = 3 次」降到 1 次，
 # 10 万请求/天的免费额度只被首页 HTML 占用。
 # binding 是必需的：有了它才能在 Worker 里用 env.ASSETS 做兜底转发
 [assets]
 directory = "./public"
 binding = "ASSETS"
-run_worker_first = ["/api/*"]
+# 首页 "/" 必须显式列进来：run_worker_first 没命中时，请求会先去找同名静态文件，
+# 只有找不到才回落到 Worker。眼下 public/ 里没有 index.html，所以也能跑到 Worker，
+# 但那是个隐式前提——哪天往 public/ 放一个 index.html，首页就会变成纯静态文件，
+# 登录态注入和 window.__CFG__ 会一起失效。显式写死，杜绝这种误伤。
+run_worker_first = ["/", "/api/*"]
 
 # 自定义域：Worker 站点入口
 # 用 custom_domain = true（而非 zone_name）：Cloudflare 自动创建 DNS 记录与证书，
@@ -28,18 +32,9 @@ custom_domain = true
 binding = "BUCKET"
 bucket_name = "r2share"
 
-# KV：存 admin 口令失败计数（限流用）
-#
-# ⚠️ 这里是占位符，不要直接填真实 id——KV namespace id 属于账户资源标识，
-# 会随仓库公开。真实值请放进本地私有配置 .deploy.local.json（已被 .gitignore 排除）：
-#   cp .deploy.local.example.json .deploy.local.json
-#   npx wrangler kv namespace create r2share_kv   # 把返回的 id 填进 kvId
-#
-# npm run dev / npm run deploy 会由 scripts/with-config.mjs 在运行时把占位符替换成
-# 真实值（临时生成 .wrangler.local.toml，用完即删），所以直接 `wrangler deploy` 会失败。
-[[kv_namespaces]]
-binding = "KV"
-id = "r2share_kv_placeholder"
+# 说明：登录失败计数已改为 Worker 模块内的内存 Map（见 src/index.ts），
+# 不再需要 KV 绑定——KV 免费版「同 key 每秒 1 次写 + 每天 1000 次写」的限制
+# 会让爆破场景下的计数失真，也平白多出一次往返。
 
 [vars]
 # R2 桶名（presigned 签名需要用到）
@@ -50,8 +45,11 @@ DL_DOMAIN = "https://dl.114448.xyz"
 SITE_NAME = "我的仓库"
 # 登录态有效期（天）
 SESSION_DAYS = "30"
-# 单文件上传上限（字节），0 表示沿用 Workers 请求体上限
-MAX_UPLOAD = "104857600"
+# 单文件上传上限（字节），0 表示沿用 Workers 请求体上限。
+# Cloudflare 账户计划（Free）对请求体的硬上限是 100 MB，超过会被边缘直接 413，
+# 请求根本到不了 Worker。这里取 95 MiB 留出余量：否则用户传一个「通过了本站校验、
+# 却被 CF 拦下」的文件，只会看到一个语焉不详的网络错误。
+MAX_UPLOAD = "99614720"
 # 生产环境上传改走 Worker 代理：'1' 开启。
 # 背景：presigned 直传目标 r2.cloudflarestorage.com 在某些网络被墙（ERR_ADDRESS_UNREACHABLE），
 # 开启后浏览器的上传 PUT 指向本 Worker 的 /api/local-put（同源，无需 CORS），

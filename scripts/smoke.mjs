@@ -1,5 +1,5 @@
 /**
- * 本地冒烟测试：验证登录、路径校验、上传、索引、下载、删除全流程
+ * 本地冒烟测试：验证登录、路径校验、上传、索引、批量接口、下载、删除全流程
  * 用法：node scripts/smoke.mjs [base_url]
  */
 
@@ -132,6 +132,70 @@ async function main() {
   ok('中文路径正确保存', idx.files.some((f) => f.p === '_smoke/你好.txt'));
   ok('文件大小已记录', idx.files.find((f) => f.p === '_smoke/data.json')?.s > 0);
 
+  console.log('\n[批量接口]');
+  // 批量上传链路：一次签名 → N 次 PUT → 一次提交索引（前端拖入多个文件时的走法）
+  const batchPaths = ['_smoke/b1.txt', '_smoke/b2.txt', '_smoke/b3.txt'];
+  const signBatch = await json('/api/sign', {
+    entries: batchPaths.map((p) => ({ path: p, size: 3, type: 'text/plain' })),
+  });
+  ok('批量签名返回 200', signBatch.status === 200, `实际 ${signBatch.status}`);
+  const signData = await signBatch.json().catch(() => ({}));
+  ok(
+    '批量签名逐条回传地址',
+    Array.isArray(signData.items) && signData.items.length === batchPaths.length,
+    `实际 ${JSON.stringify(signData.items || null)}`
+  );
+
+  let putAll = true;
+  for (const it of signData.items || []) {
+    const r = await req(it.url, {
+      method: 'PUT',
+      headers: { 'content-type': it.ctype },
+      body: 'abc',
+    });
+    if (!r.ok) putAll = false;
+  }
+  ok('批量上传的对象全部写入成功', putAll);
+
+  const commitBatch = await json('/api/commit', {
+    entries: batchPaths.map((p) => ({ path: p, type: 'text/plain' })),
+  });
+  ok('批量提交索引返回 200', commitBatch.status === 200, `实际 ${commitBatch.status}`);
+  const commitData = await commitBatch.json().catch(() => ({}));
+  ok('批量提交写入 3 条', commitData.count === 3, `实际 ${commitData.count}`);
+  ok(
+    '批量提交回传条目（供前端增量更新）',
+    Array.isArray(commitData.entries) && commitData.entries.length === 3
+  );
+  const idxBatch = await (await req('/api/local-index')).json();
+  ok(
+    '批量上传的文件都进了索引',
+    batchPaths.every((p) => idxBatch.files.some((f) => f.p === p))
+  );
+
+  const delBatch = await req('/api/files', {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ paths: batchPaths }),
+  });
+  ok('批量删除返回 200', delBatch.status === 200, `实际 ${delBatch.status}`);
+  const delData = await delBatch.json().catch(() => ({}));
+  ok('批量删除回传删除条数', delData.removed === 3, `实际 ${delData.removed}`);
+  const idxBatch2 = await (await req('/api/local-index')).json();
+  ok(
+    '批量删除后索引中已无这些条目',
+    !batchPaths.some((p) => idxBatch2.files.some((f) => f.p === p))
+  );
+
+  const badBatchDel = await req('/api/files', {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ paths: ['../etc/passwd'] }),
+  });
+  ok('批量删除拒绝非法路径', badBatchDel.status === 400, `实际 ${badBatchDel.status}`);
+  const badBatchCommit = await json('/api/commit', { entries: [{ path: 'files.json' }] });
+  ok('批量提交拒绝索引文件', badBatchCommit.status === 400, `实际 ${badBatchCommit.status}`);
+
   console.log('\n[下载]');
   const dl = await req('/api/local-get?key=' + encodeURIComponent('_smoke/你好.txt'));
   const text = await dl.text();
@@ -189,6 +253,32 @@ async function main() {
   const rfNoAuth = await json('/api/refresh', {});
   ok('未登录重建返回 401', rfNoAuth.status === 401, `实际 ${rfNoAuth.status}`);
   cookie = saved;
+
+  console.log('\n[登录限流]');
+  // 用一个伪造 IP 触发限流，避免把本机 IP 锁掉影响重复运行。
+  // 若运行环境会覆盖 x-forwarded-for，最后一条断言会翻红以暴露该问题。
+  const TEST_IP = '203.0.113.9';
+  const tryBadLogin = () =>
+    req('/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-forwarded-for': TEST_IP },
+      body: JSON.stringify({ password: 'definitely-not-the-password' }),
+    });
+  let limited = false;
+  const codes = [];
+  for (let i = 0; i < 12; i++) {
+    const r = await tryBadLogin();
+    codes.push(r.status);
+    if (r.status === 429) {
+      limited = true;
+      break;
+    }
+  }
+  ok('连续错误口令后被限流（429）', limited, `状态序列 ${codes.join(',')}`);
+
+  // 限流只应针对触发它的那个 IP —— 顺带验证计数确实按 IP 隔离
+  const stillOk = await json('/api/login', { password: PASSWORD });
+  ok('限流不牵连其他 IP（本机仍可登录）', stillOk.status === 200, `实际 ${stillOk.status}`);
 
   console.log(`\n结果：${pass} 通过，${fail} 失败\n`);
   process.exit(fail > 0 ? 1 : 0);

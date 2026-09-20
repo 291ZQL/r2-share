@@ -2,7 +2,7 @@
 /**
  * 部署前自检：抓 wrangler.toml / .dev.vars / cors.json 里的常见配置坑。
  * 不替代 wrangler deploy 自身的校验，但能提前挡住下面这些 90% 会踩的失误：
- *   - KV namespace id 还是占位符
+ *   - 首页路由没显式交给 Worker（依赖「public/ 里没有 index.html」这个隐式前提）
  *   - R2 CORS AllowedOrigins 还有未替换的占位符
  *   - 管理口令 / 会话密钥是示例值
  *
@@ -12,7 +12,6 @@
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { PLACEHOLDER, LOCAL_CFG, resolveKvId } from './local-config.mjs';
 
 let fail = 0;
 const ok = (msg) => console.log('  \x1b[32m✓\x1b[0m ' + msg);
@@ -34,36 +33,6 @@ try {
 section('2. wrangler.toml');
 const toml = await readFile('wrangler.toml', 'utf8');
 
-// 仓库里保持占位符，真实值来自本地私有配置（.deploy.local.json / 环境变量 KV_ID）
-const kvId = resolveKvId(toml);
-if (!toml.match(/id\s*=\s*"([^"]+)"/)) {
-  err('wrangler.toml 找不到 [[kv_namespaces]] 的 id 配置');
-} else if (!kvId) {
-  err(
-    `KV namespace id 还是占位符 ${PLACEHOLDER}，且本地私有配置里没有真实值\n` +
-      `     修复：cp .deploy.local.example.json .deploy.local.json，填入\n` +
-      `           npx wrangler kv namespace create r2share_kv 返回的 id\n` +
-      `     CI 场景可改用环境变量：KV_ID=<id> npm run deploy`
-  );
-} else if (/^[a-f0-9]{20,}$/.test(kvId)) {
-  ok('KV namespace id 就绪：' + kvId.slice(0, 8) + '…（真实值存于本地私有配置，仓库内保持占位符）');
-} else {
-  warn('KV namespace id 格式异常（' + kvId + '），应为 32 位十六进制，请人工确认');
-}
-
-// 隐私护栏：确认本地私有配置不会被提交进仓库
-if (existsSync(LOCAL_CFG)) {
-  let ignored = false;
-  try {
-    execSync(`git check-ignore -q ${LOCAL_CFG}`, { stdio: ['pipe', 'pipe', 'pipe'] });
-    ignored = true;
-  } catch {
-    /* 非 git 仓库或未被忽略 */
-  }
-  if (ignored) ok(`${LOCAL_CFG} 已被 git 忽略，不会进入仓库`);
-  else err(`${LOCAL_CFG} 没有被 .gitignore 排除——真实 KV id 会被提交，请先加进 .gitignore`);
-}
-
 const bucketMatch = toml.match(/bucket_name\s*=\s*"([^"]+)"/);
 if (bucketMatch) ok('R2 bucket_name = ' + bucketMatch[1]);
 else err('wrangler.toml 缺少 R2 bucket_name');
@@ -73,6 +42,30 @@ if (/DL_DOMAIN\s*=\s*"https?:\/\/[^"]+"/.test(toml)) {
   ok('DL_DOMAIN = ' + dl);
 } else {
   err('DL_DOMAIN 未设置或格式异常（应形如 https://dl.114448.xyz）');
+}
+
+// 首页必须显式走 Worker：否则请求会先找同名静态文件，一旦 public/ 出现 index.html，
+// 首页就绕过了 Worker —— 登录态注入与 window.__CFG__ 会静默失效。
+if (/run_worker_first\s*=\s*\[[^\]]*"\//.test(toml)) {
+  ok('run_worker_first 已显式包含 "/"（首页不依赖隐式回落）');
+} else {
+  warn('run_worker_first 未显式包含 "/"：首页会先查静态文件，public/ 一旦出现 index.html 就会绕过 Worker');
+}
+
+// 上传上限与 Workers 请求体上限的关系：顶格设置会让「通过本站校验」的文件被 CF 拦下
+const maxMatch = toml.match(/MAX_UPLOAD\s*=\s*"(\d+)"/);
+if (maxMatch) {
+  const max = parseInt(maxMatch[1], 10);
+  if (max === 0) ok('MAX_UPLOAD = 0（沿用 Workers 请求体上限）');
+  else if (max >= 100_000_000) warn(`MAX_UPLOAD = ${max} 顶到 CF 账户请求体上限，建议留余量（如 99614720）`);
+  else ok(`MAX_UPLOAD = ${(max / 1048576).toFixed(1)} MiB（在上限之内，留有余量）`);
+} else {
+  warn('wrangler.toml 未显式设置 MAX_UPLOAD（默认沿用 Workers 请求体上限）');
+}
+
+// KV 已移除：登录失败计数改为 Worker 内存 Map，绑定了反而说明配置没跟上
+if (/\[\[kv_namespaces\]\]/.test(toml)) {
+  warn('wrangler.toml 仍保留 [[kv_namespaces]]，但代码已改用内存限流——可以删掉这个绑定');
 }
 
 // 3. .dev.vars（本地开发）

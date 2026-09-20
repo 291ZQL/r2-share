@@ -5,6 +5,11 @@
  * 1. 索引本身也存在 R2 里（公开可读），前端直接 fetch 渲染，目录页因此零 Worker 消耗
  * 2. 更新走增量（读 → 改 → 写），不做全量重建，避免超出免费版 10ms CPU 限制
  * 3. 所有路径必须过 sanitizePath，挡住 ../ 穿越与控制字符
+ * 4. 所有索引写入都收敛到 mutateIndex 的「读 → 改 → 条件写」重试循环：
+ *    模块级 promise 锁只在单个 isolate 内有效，而 Cloudflare 会因负载或版本更新
+ *    创建多个 isolate，多端同时改索引时两边各自「读 → 改 → 写」，后写的会覆盖
+ *    先写的（丢条目）。条件写（CAS）让「读出来之后被别人改过」的提交直接失败，
+ *    从而重读重放，而不是把别人的改动盖掉。
  */
 
 export interface FileEntry {
@@ -25,16 +30,22 @@ export interface FileIndex {
 
 const INDEX_KEY = 'files.json';
 
+/** 索引对象的存储元数据：只缓存 10 秒，保证上传后能较快看到新文件 */
+const INDEX_META = {
+  contentType: 'application/json; charset=utf-8',
+  cacheControl: 'public, max-age=10',
+};
+
+/** 条件写冲突时的最大重试次数（超过则报错，交给用户重试，不静默丢改动） */
+const INDEX_TRIES = 6;
+
 /**
- * 索引更新的互斥锁：upsertFile / removeFile 都是「读 → 改 → 写」三步，
- * 并发请求会读到同一份旧索引、互相覆盖（丢更新）。用模块级 promise 链
- * 把索引写操作串行化。零依赖，Workers 单 isolate 内天然有效。
+ * 索引条件写连续冲突：重试 INDEX_TRIES 次仍被别的 isolate 抢先。
+ * 单独成类，是为了让上层能把「并发冲突」与「真正的服务端故障」区分开——
+ * 前者是瞬时竞争（对象已进桶、只是没进索引），后者才是 500。
  */
-let indexLock: Promise<unknown> = Promise.resolve();
-function withIndexLock<T>(fn: () => Promise<T>): Promise<T> {
-  const run = indexLock.then(fn, fn);
-  indexLock = run.catch(() => {});
-  return run;
+export class IndexConflictError extends Error {
+  name = 'IndexConflictError';
 }
 
 /**
@@ -73,62 +84,124 @@ export function sanitizePath(input: unknown): string | null {
   return segs.join('/');
 }
 
+function emptyIndex(): FileIndex {
+  return { updated: 0, files: [] };
+}
+
+/** 把从 R2 读到的 JSON 归一成 FileIndex；结构不对时退回空索引 */
+function normalizeIndex(data: unknown): FileIndex {
+  if (!data || !Array.isArray((data as FileIndex).files)) return emptyIndex();
+  return data as FileIndex;
+}
+
 /** 读取索引；不存在或损坏时返回空索引 */
 export async function readIndex(bucket: R2Bucket): Promise<FileIndex> {
   const obj = await bucket.get(INDEX_KEY);
-  if (!obj) return { updated: 0, files: [] };
+  if (!obj) return emptyIndex();
   try {
-    const data = (await obj.json()) as FileIndex;
-    if (!data || !Array.isArray(data.files)) {
-      return { updated: 0, files: [] };
-    }
-    return data;
+    return normalizeIndex(await obj.json());
   } catch {
-    return { updated: 0, files: [] };
+    return emptyIndex();
   }
 }
 
-export async function writeIndex(
+/**
+ * 索引写入的唯一入口：读 → 改 → 条件写（CAS），冲突则重读重放。
+ *
+ * 约束（后续改动务必遵守）：
+ *   - mutate 必须是**纯内存变换**：内部不得 await 任何存储操作。删除对象、
+ *     遍历桶这类一次性副作用必须先做完，再把结果带进 mutate。
+ *   - mutate 必须**可重放且幂等**：条件写冲突时会拿最新索引重新执行一次。
+ *   - 返回 dirty=false 表示没有任何改动，此时不会写回。
+ */
+async function mutateIndex<T>(
   bucket: R2Bucket,
-  index: FileIndex
+  mutate: (index: FileIndex) => { out: T; dirty: boolean }
+): Promise<T> {
+  for (let attempt = 0; attempt < INDEX_TRIES; attempt++) {
+    const obj = await bucket.get(INDEX_KEY);
+    let index = emptyIndex();
+    let etag: string | undefined;
+    if (obj) {
+      etag = obj.etag;
+      try {
+        index = normalizeIndex(await obj.json());
+      } catch {
+        // 索引损坏：按空索引重建，与 readIndex 的容灾语义保持一致
+      }
+    }
+
+    const { out, dirty } = mutate(index);
+    if (!dirty) return out;
+
+    index.updated = Date.now();
+    const opts: R2PutOptions = { httpMetadata: INDEX_META };
+    // 只有「索引读出来之后没人改过它」（etag 未变）才允许提交。
+    // 必须用真实 etag：etagMatches:'*' 的通配语义在 miniflare 上是反的（workers-sdk#6411）。
+    // 索引还没创建时改用 etagDoesNotMatch:'*'（仅当仍不存在才创建），
+    // 否则两个请求同时首次创建索引会互相覆盖。
+    if (etag) opts.onlyIf = { etagMatches: etag };
+    else opts.onlyIf = { etagDoesNotMatch: '*' };
+
+    const res = await bucket.put(INDEX_KEY, JSON.stringify(index), opts);
+    if (res) return out;
+    // res === null：条件不满足（别的 isolate 抢先写过）→ 重读、重放、重试
+  }
+  throw new IndexConflictError(`索引写入冲突：重试 ${INDEX_TRIES} 次仍未成功，请重试`);
+}
+
+/** 新增或更新若干条记录（增量，不重建整个索引） */
+export async function upsertFiles(
+  bucket: R2Bucket,
+  entries: FileEntry[]
 ): Promise<void> {
-  index.updated = Date.now();
-  await bucket.put(INDEX_KEY, JSON.stringify(index), {
-    httpMetadata: {
-      contentType: 'application/json; charset=utf-8',
-      // 索引会被频繁读取，缓存 10 秒保证上传后能较快看到新文件
-      cacheControl: 'public, max-age=10',
-    },
+  if (!entries.length) return;
+  await mutateIndex(bucket, (index) => {
+    // 先建一次位置表：批量上传几百个文件时，逐个 findIndex 会退化成 O(N×M)
+    const pos = new Map<string, number>();
+    index.files.forEach((f, i) => {
+      if (!pos.has(f.p)) pos.set(f.p, i);
+    });
+    for (const entry of entries) {
+      const i = pos.get(entry.p);
+      if (i === undefined) {
+        pos.set(entry.p, index.files.length);
+        index.files.push(entry);
+      } else {
+        index.files[i] = entry;
+      }
+    }
+    return { out: null, dirty: true };
   });
 }
 
-/** 新增或更新一条记录（增量，不重建整个索引） */
-export async function upsertFile(
+/** 新增或更新一条记录 */
+export function upsertFile(bucket: R2Bucket, entry: FileEntry): Promise<void> {
+  return upsertFiles(bucket, [entry]);
+}
+
+/** 批量删除记录：一次索引读写删掉多条，返回实际删掉的条数 */
+export async function removeFiles(
   bucket: R2Bucket,
-  entry: FileEntry
-): Promise<void> {
-  await withIndexLock(async () => {
-    const index = await readIndex(bucket);
-    const i = index.files.findIndex((f) => f.p === entry.p);
-    if (i >= 0) index.files[i] = entry;
-    else index.files.push(entry);
-    await writeIndex(bucket, index);
+  paths: string[]
+): Promise<number> {
+  if (!paths.length) return 0;
+  return mutateIndex(bucket, (index) => {
+    const drop = new Set(paths);
+    const next = index.files.filter((f) => !drop.has(f.p));
+    const removed = index.files.length - next.length;
+    if (!removed) return { out: 0, dirty: false };
+    index.files = next;
+    return { out: removed, dirty: true };
   });
 }
 
-/** 删除一条记录 */
+/** 删除一条记录；返回是否真的删掉了 */
 export async function removeFile(
   bucket: R2Bucket,
   path: string
 ): Promise<boolean> {
-  return withIndexLock(async () => {
-    const index = await readIndex(bucket);
-    const next = index.files.filter((f) => f.p !== path);
-    if (next.length === index.files.length) return false;
-    index.files = next;
-    await writeIndex(bucket, index);
-    return true;
-  });
+  return (await removeFiles(bucket, [path])) > 0;
 }
 
 /**
@@ -140,39 +213,37 @@ export async function removeDir(
   bucket: R2Bucket,
   path: string
 ): Promise<number> {
-  return withIndexLock(async () => {
-    const prefix = path + '/';
-    let cursor: string | undefined;
-    let n = 0;
-    do {
-      const page = await bucket.list({ prefix, cursor, limit: 1000 });
-      const keys = page.objects.map((o) => o.key);
-      if (keys.length) {
-        await bucket.delete(keys);
-        // 目录占位对象的 key 一律以 / 结尾（<dir>/ 的 0 字节对象），不计入文件数。
-        // 只排除 key === prefix 是不够的：嵌套子目录（_vf/sub/）的占位对象会被漏掉，
-        // 让「已删除（含 N 个文件）」把子目录也算成文件。
-        n += keys.filter((k) => !k.endsWith('/')).length;
-      }
-      cursor = page.truncated
-        ? (page as unknown as { cursor?: string }).cursor
-        : undefined;
-    } while (cursor);
+  const prefix = path + '/';
 
-    // 占位对象（新建目录时创建的 <dir>/ 0 字节对象）已随上面的循环一并删除：
-    // list({prefix}) 是前缀匹配，key 恰好等于 prefix 的对象也在返回结果里
-    // （计数处的 filter(k => k !== prefix) 正是把它排除掉），无需再删一次。
+  // 副作用（删对象）必须在 CAS 循环外先做完：mutate 可能被重放，不能夹带写操作
+  let n = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    const keys = page.objects.map((o) => o.key);
+    if (keys.length) {
+      await bucket.delete(keys);
+      // 目录占位对象的 key 一律以 / 结尾（<dir>/ 的 0 字节对象），不计入文件数。
+      // 只排除 key === prefix 是不够的：嵌套子目录（_vf/sub/）的占位对象会被漏掉，
+      // 让「已删除（含 N 个文件）」把子目录也算成文件。
+      n += keys.filter((k) => !k.endsWith('/')).length;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
 
-    const index = await readIndex(bucket);
+  // 占位对象（新建目录时创建的 <dir>/ 0 字节对象）已随上面的循环一并删除：
+  // list({prefix}) 是前缀匹配，key 恰好等于 prefix 的对象也在返回结果里
+  // （计数处的 filter 正是把它排除掉），无需再删一次。
+
+  await mutateIndex(bucket, (index) => {
     const next = index.files.filter(
       (f) => f.p !== prefix && !f.p.startsWith(prefix)
     );
-    if (next.length !== index.files.length) {
-      index.files = next;
-      await writeIndex(bucket, index);
-    }
-    return n;
+    if (next.length === index.files.length) return { out: null, dirty: false };
+    index.files = next;
+    return { out: null, dirty: true };
   });
+  return n;
 }
 
 /**
@@ -184,29 +255,28 @@ export async function removeDir(
 export async function rebuildIndex(
   bucket: R2Bucket
 ): Promise<{ files: number }> {
-  // 与 upsert/remove 共用同一把锁：否则「重建期间恰好有上传提交」会互相覆盖，
-  // 刚写入的新文件条目会被重建结果冲掉。多 isolate 下仍无解（已知限制）。
-  return withIndexLock(async () => {
-    const files: FileEntry[] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await bucket.list({ cursor, limit: 1000 });
-      for (const o of page.objects) {
-        if (o.key === INDEX_KEY) continue;
-        files.push({
-          p: o.key,
-          s: o.size,
-          t: o.uploaded.getTime(),
-          c: guessType(o.key),
-        });
-      }
-      cursor = page.truncated
-        ? (page as unknown as { cursor?: string }).cursor
-        : undefined;
-    } while (cursor);
-    await writeIndex(bucket, { updated: 0, files });
-    return { files: files.length };
+  // 遍历桶是副作用，放在 CAS 循环外；mutate 只负责把算好的结果换上去（幂等）
+  const files: FileEntry[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ cursor, limit: 1000 });
+    for (const o of page.objects) {
+      if (o.key === INDEX_KEY) continue;
+      files.push({
+        p: o.key,
+        s: o.size,
+        t: o.uploaded.getTime(),
+        c: guessType(o.key),
+      });
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  await mutateIndex(bucket, (index) => {
+    index.files = files;
+    return { out: null, dirty: true };
   });
+  return { files: files.length };
 }
 
 /**

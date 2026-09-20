@@ -1,9 +1,10 @@
 node_modules/
 .wrangler/
 .dev.vars
-# 本地私有部署配置（真实 KV namespace id，仓库里只留 .deploy.local.example.json）
+# 本地私有部署配置（历史遗留：KV 绑定已移除，此文件不再被任何脚本读取，
+# 保留忽略规则只是防止旧文件被误提交，可自行删除）
 .deploy.local.json
-# scripts/with-config.mjs 运行时生成的临时配置（含真实值，用完即删）
+# 旧版 scripts/with-config.mjs 生成的临时配置（脚本已删除，同属历史遗留）
 .wrangler.local.toml
 # scripts/push-gh.sh 的临时请求体/响应（中断时可能残留）
 .push_*.json

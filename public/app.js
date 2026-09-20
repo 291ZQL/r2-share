@@ -64,13 +64,20 @@ const EXT_KIND = {
   code: ['js', 'ts', 'json', 'html', 'css', 'sh', 'py', 'go', 'java', 'c', 'cpp', 'md', 'txt', 'yml', 'yaml'],
 };
 
+/**
+ * 扩展名 → 分类的反向索引（模块加载时建一次）。
+ * kindOf 在渲染时每行要调好几次（图标、徽章、预览判定），原来的写法每次都要
+ * 遍历 7 个分类做 includes，上千行的目录会退化成几万次线性比较。
+ */
+const KIND_BY_EXT = new Map();
+for (const kind in EXT_KIND) {
+  for (const ext of EXT_KIND[kind]) if (!KIND_BY_EXT.has(ext)) KIND_BY_EXT.set(ext, kind);
+}
+
 function kindOf(name, isDir) {
   if (isDir) return 'dir';
   const ext = name.split('.').pop().toLowerCase();
-  for (const kind in EXT_KIND) {
-    if (EXT_KIND[kind].includes(ext)) return kind;
-  }
-  return 'file';
+  return KIND_BY_EXT.get(ext) || 'file';
 }
 
 const ICONS = {
@@ -108,6 +115,9 @@ const KIND_LABEL = {
   code: '代码',
   file: '文件',
 };
+
+/** 网格视图里超过这个大小的图片不再加载真实缩略图（否则一个照片目录能瞬间拉掉几百 MB） */
+const THUMB_MAX = 300 * 1024;
 
 /* ---------------- 目录模型 ---------------- */
 
@@ -187,6 +197,7 @@ function renderCrumb() {
       state.searchMode = false;
       state.q = '';
       $('q').value = '';
+      resetSel();
       render();
     };
     return;
@@ -209,6 +220,7 @@ function renderCrumb() {
     a.onclick = (e) => {
       e.preventDefault();
       state.cur = a.dataset.p;
+      resetSel();
       render();
     };
   });
@@ -477,7 +489,9 @@ function renderGrid(items) {
 
   const fileCells = items.files.map((f) => {
     const kind = kindOf(f.name, false);
-    const thumb = kind === 'image'
+    // 大图不在网格里拿原图当缩略图：一个 50 张照片的目录能瞬间吃掉几百 MB。
+    // 超过 THUMB_MAX 的退回类型图标，点开预览时才真正拉原图。
+    const thumb = kind === 'image' && (f.s || 0) <= THUMB_MAX
       ? `<div class="thumb"><img loading="lazy" src="${esc(dlUrl(f.p))}" alt=""><span class="tag">图片</span></div>`
       : `<div class="thumb t-${kind}"><span class="tag">${KIND_LABEL[kind] || '文件'}</span>${badge(f.name, false, 32)}</div>`;
     return `<div class="cell" data-cell="${esc(f.p)}">
@@ -512,6 +526,18 @@ function updateBatch() {
 }
 
 /**
+ * 清空批量选择。
+ * 切换目录/切换搜索视图时必须调用：选择集是按完整路径存的，跨视图会留下
+ * 当前看不见的条目——在 A 目录勾了几项、走进 B 目录再点批量删除，
+ * A 目录那些文件会被一起删掉。
+ */
+function resetSel() {
+  if (!state.sel.size) return;
+  state.sel.clear();
+  updateBatch();
+}
+
+/**
  * 行/单元格操作事件委托。
  * 列表与网格共用：只在初始化时绑定一次，通过 data-* 属性分发，
  * 避免每次渲染重复遍历绑定。
@@ -528,6 +554,7 @@ function bindRowEvents() {
     if (dirEl) {
       e.preventDefault();
       state.cur = dirEl.dataset.dir;
+      resetSel();
       render();
       return;
     }
@@ -608,7 +635,7 @@ async function deleteOne(path) {
     state.sel.delete(path);
     updateBatch();
     toast('已删除');
-    await loadIndex();
+    dropIndexPaths([path]);
   } else {
     toast(data.error || '删除失败', 'err');
   }
@@ -629,7 +656,7 @@ async function deleteDir(path) {
     for (const p of state.sel) if (p === path || p.startsWith(path + '/')) state.sel.delete(p);
     updateBatch();
     toast(data.removed ? `已删除（含 ${data.removed} 个文件）` : '已删除');
-    await loadIndex();
+    dropIndexPaths([path]);
   } else {
     toast(data.error || '删除失败', 'err');
   }
@@ -671,7 +698,25 @@ async function batchCopy() {
 }
 
 function batchDownload() {
-  [...state.sel].forEach((p) => window.open(dlUrl(p), '_blank'));
+  const paths = [...state.sel];
+  if (!paths.length) return;
+  // 不能用 window.open 循环：浏览器弹窗拦截器只放行第一个，后面的全被吞掉，
+  // 表现就是「批量下载明明选了 N 个却只下了一个」。改成依次触发 <a download>，
+  // 同一个用户手势内的程序化点击不会触发拦截，间隔留一点让浏览器排队。
+  if (paths.length > 5) {
+    toast(`开始下载 ${paths.length} 个文件，浏览器可能提示「是否允许下载多个文件」`);
+  }
+  paths.forEach((p, i) => {
+    setTimeout(() => {
+      const a = document.createElement('a');
+      a.href = dlUrl(p);
+      a.download = p.split('/').pop() || 'file';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }, i * 400);
+  });
 }
 
 async function batchDelete() {
@@ -684,15 +729,23 @@ async function batchDelete() {
     danger: true,
   });
   if (!sure) return;
-  let ok = 0;
-  for (const p of [...state.sel]) {
-    const { res } = await apiDel(p);
-    if (res.ok) ok++;
-  }
+  // 一次请求删完：逐个调用 /api/file 会变成 N 次 Worker 请求 + N 次索引读改写，
+  // 服务端的 /api/files 把它们合并成一次批量对象删除 + 一次索引写。
+  const paths = [...state.sel];
+  const res = await fetch('/api/files', {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ paths }),
+  });
+  const data = await res.json().catch(() => ({}));
   state.sel.clear();
   updateBatch();
-  toast(`已删除 ${ok}/${n}`);
-  await loadIndex();
+  if (res.ok) {
+    toast(`已删除 ${data.removed || 0}/${n}`);
+    dropIndexPaths(paths);
+  } else {
+    toast(data.error || '删除失败', 'err');
+  }
 }
 
 function render() {
@@ -853,7 +906,44 @@ function md(src) {
   return s.replace(/\x00(\d+)\x00/g, (m, i) => stash[+i]);
 }
 
-/* ---------------- 数据加载 ---------------- */
+/* ---------------- 数据加载 ----------------
+ * 索引在本地维护：上传/删除/新建目录成功后直接就地增量更新（applyIndexEntries /
+ * dropIndexPaths），只有首次加载、点「重建索引」和点站点标题回首页才真的去下载
+ * 整份 files.json。这样日常操作不必每次都拉一遍完整索引。
+ */
+
+/**
+ * 把若干条目并进本地索引（同路径替换，新路径追加）并重绘。
+ * 服务端写入索引后会把这些条目回传，前端直接采用，省掉一次全量拉取。
+ */
+function applyIndexEntries(entries) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  const pos = new Map();
+  state.index.forEach((f, i) => {
+    if (!pos.has(f.p)) pos.set(f.p, i);
+  });
+  for (const e of entries) {
+    if (!e || typeof e.p !== 'string') continue;
+    const i = pos.get(e.p);
+    if (i === undefined) {
+      pos.set(e.p, state.index.length);
+      state.index.push(e);
+    } else {
+      state.index[i] = e;
+    }
+  }
+  render();
+}
+
+/** 从本地索引移除若干路径（目录按前缀一并移除）并重绘 */
+function dropIndexPaths(paths) {
+  if (!paths || !paths.length) return;
+  const exact = new Set(paths);
+  state.index = state.index.filter(
+    (f) => !exact.has(f.p) && !paths.some((p) => f.p.startsWith(p + '/'))
+  );
+  render();
+}
 
 async function loadIndex() {
   // 非本地模式且未配置下载域：索引无法获取，跳过 fetch('') 直接按空索引渲染
@@ -917,6 +1007,10 @@ async function pool(items, limit, worker) {
  * 上传一批文件。入参元素支持两种形态：
  *   File            —— 平铺上传到当前目录
  *   { file, path }  —— 按 path（相对当前目录）上传，用于文件夹拖拽时保留目录结构
+ *
+ * 链路：一次批量签名 → 并发 PUT → 一次批量提交索引。
+ * 逐文件发三次请求时，拖入几百个文件会放大成几百次 Worker 调用和几百次
+ * 索引读改写；批量后只剩「N 次 PUT + 2 次控制请求」，索引读写压到 1 次。
  */
 async function uploadFiles(list) {
   const items = [...list].map((it) => (it instanceof File ? { file: it, path: it.name } : it));
@@ -926,87 +1020,199 @@ async function uploadFiles(list) {
   box.classList.remove('hidden');
   if (items.length > 20) toast(`正在上传 ${items.length} 个文件…`);
 
+  // 目标目录在整批上传期间固定：pool 是排队执行的，若上传途中切了目录，
+  // 后调度的文件会读到新的 state.cur，从而落到别的目录去
+  const baseDir = state.cur;
+
   // 每个文件一行独立进度，失败行保留并给出重试按钮
-  await pool(items, 4, (item) => uploadOne(item.file, box, item.path));
+  const jobs = items.map((it) => {
+    const rel = it.path || it.file.name;
+    return {
+      file: it.file,
+      rel,
+      path: baseDir ? baseDir + '/' + rel : rel,
+      row: addUpRow(box, rel),
+      url: '',
+      ctype: '',
+      ok: false,
+    };
+  });
 
-  // 成功的行会自行移除，容器此时可能已经空了。空容器有 1px 边框，会在页面上
-  // 留一条细线，所以收干净；只有存在失败行（带重试按钮）时才继续显示。
+  await runBatchUpload(jobs);
+
+  // 成功的行会在 1.2 秒后自行移除，此时容器可能已经空了。空容器有 1px 边框，
+  // 会在页面上留一条细线，所以收干净；只有存在失败行（带重试按钮）时才继续显示。
   if (!box.children.length) box.classList.add('hidden');
-
-  await loadIndex();
 }
 
-/**
- * 上传单个文件。失败时不移除行，而是显示「重试」按钮，
- * 点击后对同一文件重新走 sign → PUT → commit。
- * relPath：相对当前目录的路径（文件夹拖拽时为「目录/子目录/文件名」）
- */
-async function uploadOne(file, box, relPath) {
-  const rel = relPath || file.name;
-  const path = state.cur ? state.cur + '/' + rel : rel;
+/** 在进度区追加一行，返回该行元素 */
+function addUpRow(box, rel) {
   const row = document.createElement('div');
   row.className = 'up-item';
   row.innerHTML = `<span class="up-name" title="${esc(rel)}">${esc(rel)}</span>
     <span class="up-bar"><i></i></span>
     <span class="up-st">等待中</span>`;
   box.appendChild(row);
-  const bar = row.querySelector('.up-bar i');
-  const st = row.querySelector('.up-st');
+  return row;
+}
 
-  // 统一小写化 MIME：SigV4 签名会对 Content-Type 做 toLowerCase（sigv4.ts），
-  // 若这里用浏览器原始大小写（如 Text/Plain）而签名基于小写，R2 会判签名不匹配返回 403。
-  // 因此 sign / PUT / commit 三处共用同一小写值，保证与签名契约完全一致。
-  const type = (file.type || 'application/octet-stream').toLowerCase();
+/** 行状态：写入完成，稍后自动消失（顺带把空的上传容器收起来） */
+function markDone(j) {
+  const st = j.row.querySelector('.up-st');
+  st.textContent = '完成';
+  st.className = 'up-st ok';
+  setTimeout(() => {
+    j.row.remove();
+    const box = $('uploading');
+    if (box && !box.children.length) box.classList.add('hidden');
+  }, 1200);
+}
 
-  const doUpload = async () => {
-    // 重试时清掉旧的失败态
-    const oldRetry = row.querySelector('.up-retry');
-    if (oldRetry) oldRetry.remove();
-    st.className = 'up-st';
-    st.textContent = '上传中';
-    bar.style.width = '0%';
-    try {
-      const signRes = await fetch('/api/sign', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path, size: file.size, type }),
-      });
-      const sign = await signRes.json();
-      if (!signRes.ok) throw new Error(sign.error || '签名失败');
+/** 行状态：失败，附「重试」按钮（重试走单文件链路，不依赖整批的签名结果） */
+function markFail(j, msg) {
+  const st = j.row.querySelector('.up-st');
+  st.textContent = msg;
+  st.className = 'up-st err';
+  const old = j.row.querySelector('.up-retry');
+  if (old) old.remove();
+  const btn = document.createElement('button');
+  btn.className = 'mini up-retry';
+  btn.textContent = '重试';
+  btn.onclick = () => retryOne(j);
+  j.row.appendChild(btn);
+}
 
+/**
+ * 批量上传：一次签名 → 并发 PUT → 一次提交索引。
+ * 两个控制步骤都按「整批」合并，只有真正的数据传输（PUT）按并发池展开。
+ */
+async function runBatchUpload(jobs) {
+  // 1) 一次性签名（N 次请求压成 1 次）
+  try {
+    const res = await fetch('/api/sign', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        entries: jobs.map((j) => ({
+          path: j.path,
+          size: j.file.size,
+          // 统一小写：SigV4 签名会对 Content-Type 做 toLowerCase（sigv4.ts），
+          // 大小写不一致会让 R2 判签名不匹配返回 403
+          type: (j.file.type || 'application/octet-stream').toLowerCase(),
+        })),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || '签名失败');
+    const signed = Array.isArray(data.items) ? data.items : [];
+    if (signed.length !== jobs.length) throw new Error('签名结果数量不匹配');
+    jobs.forEach((j, i) => {
+      j.url = signed[i].url;
       // 优先用服务端回传的 ctype：它按扩展名归一（浏览器给不出 7z/dmg/apk 的 MIME），
-      // 且 presigned 模式下就是签名用的值，必须与 PUT 头完全一致否则 403。
-      const upType = sign.ctype || type;
+      // 且 presigned 模式下就是签名用的值，必须与 PUT 头完全一致否则 403
+      j.ctype = signed[i].ctype || (j.file.type || 'application/octet-stream').toLowerCase();
+    });
+  } catch (err) {
+    for (const j of jobs) markFail(j, err.message || '签名失败');
+    return;
+  }
 
-      await putFile(sign.url, file, (p) => {
+  // 2) 并发 PUT（只有这一步在传数据）
+  await pool(jobs, 4, (j) => putJob(j));
+
+  // 3) 提交索引：只提交 PUT 成功的，整批一次
+  const done = jobs.filter((j) => j.ok);
+  if (!done.length) return;
+  try {
+    const res = await fetch('/api/commit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ entries: done.map((j) => ({ path: j.path, type: j.ctype })) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || '索引写入失败');
+    const missing = new Set(Array.isArray(data.missing) ? data.missing : []);
+    for (const j of done) {
+      if (missing.has(j.path)) markFail(j, '对象未落盘');
+      else markDone(j);
+    }
+    // 索引就地增量更新，不再为一次上传重新下载整份 files.json
+    applyIndexEntries(data.entries);
+  } catch (err) {
+    for (const j of done) markFail(j, err.message || '索引写入失败');
+  }
+}
+
+/** 单个文件的 PUT，带进度条 */
+function putJob(j) {
+  const bar = j.row.querySelector('.up-bar i');
+  const st = j.row.querySelector('.up-st');
+  st.className = 'up-st';
+  st.textContent = '上传中';
+  bar.style.width = '0%';
+  return putFile(
+    j.url,
+    j.file,
+    (p) => {
+      bar.style.width = Math.round(p * 100) + '%';
+      st.textContent = Math.round(p * 100) + '%';
+    },
+    j.ctype
+  )
+    .then(() => {
+      j.ok = true;
+      st.textContent = '写入索引';
+    })
+    .catch((err) => {
+      j.ok = false;
+      markFail(j, err.message || '上传失败');
+    });
+}
+
+/** 失败行的重试：走完整的单文件链路（sign → PUT → commit） */
+async function retryOne(j) {
+  const btn = j.row.querySelector('.up-retry');
+  if (btn) btn.remove();
+  const st = j.row.querySelector('.up-st');
+  const bar = j.row.querySelector('.up-bar i');
+  st.className = 'up-st';
+  st.textContent = '重试中';
+  bar.style.width = '0%';
+  try {
+    const type = (j.file.type || 'application/octet-stream').toLowerCase();
+    const signRes = await fetch('/api/sign', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: j.path, size: j.file.size, type }),
+    });
+    const sign = await signRes.json().catch(() => ({}));
+    if (!signRes.ok) throw new Error(sign.error || '签名失败');
+    const ctype = sign.ctype || type;
+
+    st.textContent = '上传中';
+    await putFile(
+      sign.url,
+      j.file,
+      (p) => {
         bar.style.width = Math.round(p * 100) + '%';
         st.textContent = Math.round(p * 100) + '%';
-      }, upType);
+      },
+      ctype
+    );
 
-      st.textContent = '写入索引';
-      const commit = await fetch('/api/commit', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path, size: file.size, type: upType }),
-      });
-      if (!commit.ok) throw new Error('索引写入失败');
-
-      st.textContent = '完成';
-      st.className = 'up-st ok';
-      setTimeout(() => row.remove(), 1200);
-    } catch (err) {
-      st.textContent = err.message || '失败';
-      st.className = 'up-st err';
-      // 失败行保留，附「重试」按钮
-      const btn = document.createElement('button');
-      btn.className = 'mini up-retry';
-      btn.textContent = '重试';
-      btn.onclick = doUpload;
-      row.appendChild(btn);
-    }
-  };
-
-  await doUpload();
+    st.textContent = '写入索引';
+    const commit = await fetch('/api/commit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: j.path, type: ctype }),
+    });
+    const data = await commit.json().catch(() => ({}));
+    if (!commit.ok) throw new Error(data.error || '索引写入失败');
+    markDone(j);
+    applyIndexEntries(data.entries);
+  } catch (err) {
+    markFail(j, err.message || '失败');
+  }
 }
 
 /* ---------------- 上传入口：拖放 + 粘贴 ---------------- */
@@ -1177,6 +1383,7 @@ function bindEvents() {
       state.searchMode = false;
       const q = $('q');
       if (q) q.value = '';
+      resetSel();
       loadIndex();
     };
   }
@@ -1208,6 +1415,7 @@ function bindEvents() {
     timer = setTimeout(() => {
       state.q = v;
       state.searchMode = !!v;
+      resetSel();
       render();
     }, 200);
   };
@@ -1301,7 +1509,8 @@ function bindEvents() {
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         toast('目录已创建');
-        await loadIndex();
+        // 目录占位条目：与 /api/mkdir 写进索引的内容保持一致
+        applyIndexEntries([{ p: path + '/', s: 0, t: Date.now(), c: 'application/octet-stream' }]);
       } else {
         toast(data.error || '创建失败', 'err');
       }
