@@ -11,13 +11,14 @@
 未登录列表视图（默认）：
 ![home](docs/screenshots/home.png)
 
-未登录网格视图：
+未登录网格视图（右上角切换；单元格底部操作栏 hover 时浮出）：
 ![grid](docs/screenshots/grid.png)
 
-登录后顶部多出「重建索引 / 上传 / 退出」三个按钮，文件行 hover 出现删除按钮：
+登录后顶部多出「重建索引 / 新建目录 / 上传 / 退出」四个按钮，每行出现删除按钮，
+并展开上传拖拽区（列表视图的删除按钮常显，不依赖 hover）：
 ![login](docs/screenshots/login.png)
 
-README.md 预览弹层（标题右侧「下载」按钮直链下载）：
+Markdown / 文本预览弹层（标题栏右侧「下载」按钮直链下载）：
 ![preview](docs/screenshots/preview.png)
 
 搜索无结果时的空态（与「目录为空」文案分开）：
@@ -35,6 +36,8 @@ README.md 预览弹层（标题右侧「下载」按钮直链下载）：
  └─ 上传 N 个文件 ─→ Worker /api/sign（1 次请求，批量签发）
                      → 浏览器并发 PUT 同源 /api/local-put（每文件 1 次请求，Worker 内部写 R2）
                      → Worker /api/commit（1 次请求，批量写索引）
+                     （N > 400 时前端自动按 400 一批分片，sign / commit 各调用多次；
+                       原因见下文「已知限制」）
 ```
 
 默认上传走 **Worker 代理**（`UPLOAD_VIA_WORKER = "1"`）：浏览器的 PUT 指向本 Worker
@@ -91,6 +94,12 @@ README.md 预览弹层（标题右侧「下载」按钮直链下载）：
 1. **`mutate` 必须是纯内存变换**——内部不得 `await` 任何存储操作。删对象、遍历桶这类
    一次性副作用必须先做完，再把结果带进回调。
 2. **`mutate` 必须可重放且幂等**——冲突时会拿最新索引重新执行一次，重复执行不能产生叠加效果。
+3. **无变化就别写**——回调返回 `dirty: false` 时不会发起写入。`upsertFiles` 逐字段
+   （`p` / `s` / `t` / `c`）比对，完全一致才算「无变化」：重复建同名目录、重试一次其实
+   已经成功的 `commit`，都不该白触发一次「读索引 + 写索引」，也不该平白制造一次 CAS
+   争用（多端并发时它正是 409 的来源之一）。代价是**调用方必须给出稳定的 `t`**
+   （`/api/commit` 用 `obj.uploaded`、`/api/mkdir` 用占位对象自己的 `uploaded`），
+   否则 `t` 每次都不一样，这条优化永远不生效。
 
 ---
 
@@ -324,8 +333,8 @@ npm install
 cp .dev.vars.example .dev.vars   # 按需改口令；要跑 deploy/gen-config 还要填 WORKER_DOMAIN、DL_DOMAIN
 npm run dev                      # http://127.0.0.1:8787（用模板 wrangler.toml）
 node scripts/seed.mjs            # 灌入演示数据
-TEST_PASSWORD='<.dev.vars 里的 ADMIN_PASSWORD>' node scripts/smoke.mjs   # 全流程冒烟（49 项）
-npm test                         # 单元测试（228 项，见下）
+TEST_PASSWORD='<.dev.vars 里的 ADMIN_PASSWORD>' node scripts/smoke.mjs   # 全流程冒烟（64 项，含 Range 切片）
+npm test                         # 单元测试（263 项，见下）
 npm run gen-config               # 部署前：生成 wrangler.deploy.toml（域名取自环境变量 / .dev.vars）
 npm run check                    # 部署前自检（校验生成物）
 ```
@@ -341,9 +350,9 @@ npm run check                    # 部署前自检（校验生成物）
 | --- | --- | --- |
 | `scripts/test-crypto.mjs` | SigV4 签名向量、会话 cookie 加签/验签 | 14 |
 | `scripts/test-mode.mjs` | 运行模式判定（代理/直连、上传通道）、会话密钥派生与守卫 | 25 |
-| `scripts/test-store.mjs` | 路径与 MIME 校验、索引 CAS（含冲突重试、批量幂等、递归删目录）、冲突异常类型与 409 映射契约 | 100 |
+| `scripts/test-store.mjs` | 路径与 MIME 校验、索引 CAS（含冲突重试、批量幂等、无变化不写、递归删目录）、写入口径与 409 映射契约 | 114 |
 | `scripts/test-preview.mjs` | 前端纯函数：预览分类、Markdown 渲染 | 54 |
-| `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约 + 部署配置断言 | 35 |
+| `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约（分批上限、O(N×M) 回归）+ 部署配置断言 | 56 |
 
 `TEST_PASSWORD` 不传时会用默认值 `dev123456`，与 `.dev.vars` 里的真实口令对不上，
 表现为登录 401 之后整串用例连锁失败——**跑冒烟务必显式带上它**。
@@ -406,8 +415,8 @@ npm run push:gh -- src/index.ts public/app.js   # 只同步指定文件
 | --- | --- | --- | --- |
 | GET | `/` | 否 | 渲染目录页 HTML（目录数据由前端直连 R2 拉 files.json） |
 | POST | `/api/login` / `/api/logout` | 否 | 登录 / 登出；登录失败计数超阈值返回 429 |
-| POST | `/api/sign` | 是 | 签发上传地址。`{path,size,type}` 单条，`{entries:[…]}` 批量 |
-| POST | `/api/commit` | 是 | 写入索引。`{path,type}` 单条，`{entries:[…]}` 批量；响应回传 `entries`/`missing` |
+| POST | `/api/sign` | 是 | 签发上传地址。`{path,size,type}` 单条，`{entries:[…]}` 批量，单次最多 1000 条 |
+| POST | `/api/commit` | 是 | 写入索引。`{path,type}` 单条，`{entries:[…]}` 批量，**单次最多 400 条**；响应回传 `entries`/`missing` |
 | DELETE | `/api/file` | 是 | 删除单个文件（对象 + 索引） |
 | DELETE | `/api/files` | 是 | 批量删除。`{paths:[…]}`，单次最多 1000 个 |
 | POST | `/api/mkdir` | 是 | 新建目录（写 `<path>/` 占位对象，幂等） |
@@ -450,7 +459,19 @@ rclone sync r2:r2share b2:你的桶 --progress
 ## 已知限制
 
 - 没有网页端的文件重命名 / 移动 / 打包下载（R2 无 rename，目录移动是 O(n) 操作），需要时用 rclone
-- 目录页不是严格实时：`files.json` 缓存 10 秒
+- 目录页不是严格实时：`files.json` 写入时带 `Cache-Control: public, max-age=10`
+  （`src/store.ts` 的 `INDEX_META`），**CDN 层**最多缓存 10 秒；前端拉取时另加
+  `cache: 'no-store'`，让**浏览器**不吃本地缓存。日常上传 / 删除靠前端本地增量更新
+  立即可见，只有「刷新页面重新拉整份索引」才可能读到 10 秒内的旧索引
+- **一次提交索引的批大小是 400**（`MAX_COMMIT_BATCH`）：`/api/commit` 每一条都要
+  一次 R2 `head` 校验对象真实存在，再加一次索引读 + 一次索引写，N 条就是
+  **N+2 个子请求**；而 Cloudflare 对「内部服务（R2 / KV / D1）子请求」有
+  **每请求 1000 次**的硬上限（免费与付费同，`get`/`put`/`head`/`list`/`delete` 全计入）。
+  顶格 1000 条必然超限，症状还偏偏是最难排查的那种：签名成功、PUT 成功、
+  提交整批 500，而对象其实已经写进桶——用户只看到「上传失败」。
+  前端会自动按 400 分片（`public/app.js` 的 `UPLOAD_CHUNK`），
+  所以一次拖入上千个文件仍然可用，只是会拆成多次 sign / commit 调用。
+  `/api/sign` 不碰 R2、只做 HMAC，上限仍是 1000（`MAX_SIGN_BATCH`）
 - 上传接口有登录保护，但文件本身是公开的（这是设计选择）
 - presigned PUT URL 只绑定路径和 1 小时有效期，**不绑定文件大小**：`/api/sign`
   的 size 上限校验是业务约束（`MAX_UPLOAD`，默认 95 MiB），拿到签名 URL 后实际可传更大文件。
