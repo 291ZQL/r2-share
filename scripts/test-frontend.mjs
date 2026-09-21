@@ -88,7 +88,7 @@ function load() {
     'window',
     'document',
     `${body}
-return { state, resetSel, applyIndexEntries, dropIndexPaths, kindOf, updateBatch };`
+return { state, resetSel, applyIndexEntries, dropIndexPaths, kindOf, updateBatch, chunk, UPLOAD_CHUNK };`
   );
   return fn(
     { __CFG__: { dlDomain: 'https://dl.example.com', isLogin: true } },
@@ -141,6 +141,58 @@ group('本地索引：删除时按路径与前缀移除');
   eq('空路径数组是安全的', api.state.index.length, 1);
 }
 
+group('本地索引：删除多级目录与深层祖先');
+{
+  const api = load();
+  api.state.index = [
+    entry('a.txt'),
+    entry('d/'),
+    entry('d/x.txt'),
+    entry('dd.txt'),
+    entry('d/sub/'),
+    entry('d/sub/y.txt'),
+    entry('d/sub/deep/z.txt'),
+    entry('e.txt'),
+  ];
+  // 关键回归：'dd.txt' 不能被当成 'd' 的前缀命中（拼 p + '/' 才天然避开）
+  api.dropIndexPaths(['d/sub']);
+  eq('多级路径只删该子树', api.state.index.map((f) => f.p), [
+    'a.txt',
+    'd/',
+    'd/x.txt',
+    'dd.txt',
+    'e.txt',
+  ]);
+  eq('更深的条目也被祖先前缀命中', api.state.index.some((f) => f.p.startsWith('d/sub/')), false);
+
+  // 祖先在列表里、子孙在更深处：删中间层要连带整棵子树
+  const api2 = load();
+  api2.state.index = [
+    entry('x/'),
+    entry('x/a/'),
+    entry('x/a/b/'),
+    entry('x/a/b/c.txt'),
+    entry('y.txt'),
+  ];
+  api2.dropIndexPaths(['x/a']);
+  eq('删中间层目录连带整棵子树', api2.state.index.map((f) => f.p), ['x/', 'y.txt']);
+
+  // 不存在的路径：不该动任何东西
+  api2.dropIndexPaths(['nope/deep']);
+  eq('删除不存在的路径是安全的', api2.state.index.map((f) => f.p), ['x/', 'y.txt']);
+}
+
+group('chunk：分批切片的边界');
+{
+  const api = load();
+  eq('空数组切成 0 块', api.chunk([], 2).length, 0);
+  eq('正好整除', api.chunk([1, 2, 3, 4], 2).map((a) => a.length), [2, 2]);
+  eq('有余数时最后一块较短', api.chunk([1, 2, 3], 2).map((a) => a.length), [2, 1]);
+  eq('不足一块时只切一块', api.chunk([1], 400).length, 1);
+  eq('size 非正数时原样返回一块', api.chunk([1, 2, 3], 0).map((a) => a.length), [3]);
+  eq('切片顺序与内容不变', api.chunk([1, 2, 3], 2), [[1, 2], [3]]);
+}
+
 group('kindOf：走查表后行为不变');
 {
   const api = load();
@@ -166,12 +218,31 @@ eq('上传批次内固定目标目录（快照 baseDir）', has(/const baseDir =
 eq('批量下载不再用 window.open（会被弹窗拦截）', fnBody('batchDownload').replace(/\/\/[^\n]*/g, '').includes('window.open'), false);
 eq('批量下载改触发 <a download>', fnBody('batchDownload').includes('a.download'), true);
 eq('网格缩略图受 THUMB_MAX 约束', has(/kind === 'image' && \(f\.s \|\| 0\) <= THUMB_MAX/), true);
-eq('上传走批量签名', has(/entries: jobs\.map\(/), true);
-eq('上传走批量提交索引', has(/entries: done\.map\(/), true);
+eq('上传走分批批量签名', has(/for \(const part of chunk\(jobs, UPLOAD_CHUNK\)\)/), true);
+eq('上传走分批批量提交索引', has(/for \(const part of chunk\(done, UPLOAD_CHUNK\)\)/), true);
+eq('每批的 entries 由 part 组装（不再是整批 jobs/done）', has(/entries: part\.map\(/), true);
+{
+  // 前后端必须成对改：只改服务端不改前端 → 大批判上传必被 413；
+  // 只改前端不改服务端 → 白分片。这里直接读 src/index.ts 的常量交叉校验。
+  const idxSrc = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const m = idxSrc.match(/const MAX_COMMIT_BATCH = (\d+);/);
+  const limit = m ? Number(m[1]) : NaN;
+  const apiC = load();
+  eq('能从 src/index.ts 读到 MAX_COMMIT_BATCH', Number.isFinite(limit), true);
+  eq('前端 UPLOAD_CHUNK 不超过服务端 MAX_COMMIT_BATCH', apiC.UPLOAD_CHUNK <= limit, true);
+  eq('服务端为「N 条 head + 索引读 + 索引写」留了子请求余量', limit + 2 <= 1000, true);
+}
 eq('上传后不再整份重拉索引', fnBody('runBatchUpload').includes('loadIndex'), false);
 eq('批量删除走一次 /api/files', has(/fetch\('\/api\/files'/), true);
 eq('单个删除改为本地增量', fnBody('deleteOne').includes('dropIndexPaths'), true);
 eq('未登录仍不渲染选择框', has(/CFG\.isLogin\s*\?[\s\S]{0,80}class="sel"/), true);
+eq('dropIndexPaths 不再对每个条目遍历一遍 paths（O(N×M)）', /\.some\(/.test(fnBody('dropIndexPaths')), false);
+eq('dropIndexPaths 改用祖先集合 + 逐级回退', fnBody('dropIndexPaths').includes('lastIndexOf'), true);
+eq('批量下载保留 <a download> 触发方式', fnBody('batchDownload').includes('a.download'), true);
+eq('批量下载先剔掉无效链接（#）', fnBody('batchDownload').includes("u !== '#'"), true);
+eq('网格点击不再无条件打开链接', has(/if \(url && url !== '#'\) window\.open\(url, '_blank'\);/), true);
+eq('批量删除失败时不清空选择（旧写法已移除）', has(/state\.sel\.clear\(\);\s*updateBatch\(\);\s*if \(res\.ok\)/), false);
+eq('批量删除只在成功分支清空选择', has(/if \(res\.ok\) \{\s*state\.sel\.clear\(\);/), true);
 
 group('部署配置：首页必须显式走 Worker');
 const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');

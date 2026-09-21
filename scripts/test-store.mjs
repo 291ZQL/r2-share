@@ -323,5 +323,63 @@ group('索引写入 —— 递归删目录');
   eq('索引里只剩目录外的条目', (await readIndex(b)).files.map((f) => f.p), ['other.txt']);
 }
 
+group('索引写入 —— 无变化时不写索引（空转优化）');
+{
+  const b = new FakeBucket();
+  await upsertFiles(b, [ent('a.txt')]);
+  const base = b.putLog.length; // 首次创建索引：1 次写
+
+  // 逐字段完全相同的条目必须判为「无变化」，连 put 都不该发起。
+  // 这是 P3⑩ 的核心：原样重复提交（重复建同名目录、重试一次其实已成功的 commit）
+  // 不该白触发一次「读索引 + 写索引」，也不该平白制造一次 CAS 争用。
+  await upsertFiles(b, [ent('a.txt')]);
+  eq('逐字段相同的条目不再发起索引写', b.putLog.length, base);
+
+  // 任一字段变化都必须照旧写，否则「重新上传」在索引里就看不出来了
+  await upsertFiles(b, [ent('a.txt', 2)]);
+  eq('大小变化时照旧写入', b.putLog.length, base + 1);
+  await upsertFiles(b, [{ p: 'a.txt', s: 2, t: 2, c: 'text/plain' }]);
+  eq('上传时间变化时照旧写入', b.putLog.length, base + 2);
+  await upsertFiles(b, [{ p: 'a.txt', s: 2, t: 2, c: 'application/json' }]);
+  eq('MIME 变化时照旧写入', b.putLog.length, base + 3);
+
+  // 混合批次：有一条真变了就要写，且没变的条目不能被改坏
+  await upsertFiles(b, [
+    { p: 'a.txt', s: 2, t: 2, c: 'application/json' },
+    ent('new.txt'),
+  ]);
+  eq('混合批次仍写入', b.putLog.length, base + 4);
+  const idx = await readIndex(b);
+  eq('未变化的条目内容保持原样', idx.files.find((f) => f.p === 'a.txt').c, 'application/json');
+  eq('新条目进了索引', idx.files.some((f) => f.p === 'new.txt'), true);
+  eq('索引里没有重复条目', idx.files.length, 2);
+}
+
+group('源码契约：索引写入口径（防回归）');
+{
+  const idxSrc = fs.readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  // cleanType 必须覆盖控制字符全集（0x1f），不能只去 CR/LF —— 注释与实现要对得上。
+  // 注意必须只看**函数体**：cleanType 上方的注释里本来就写了 001f，
+  // 直接对全文 includes 会假绿（实测踩到）。
+  const ctFn = (idxSrc.match(/function cleanType[\s\S]*?\n\}/) || [''])[0];
+  eq('cleanType 覆盖到控制字符 0x1f', ctFn.includes('001f'), true);
+  // /api/local-put 是生产上传主路径，Content-Type 必须与 sign/commit 同口径
+  eq(
+    '/api/local-put 的 Content-Type 也过 cleanType',
+    idxSrc.includes('resolveType(key, cleanType('),
+    true
+  );
+  // 批上限拆成两个常量：sign 不碰 R2（1000），commit 每条一次 head（400）
+  eq('sign 与 commit 用各自的批上限常量', idxSrc.includes('MAX_SIGN_BATCH'), true);
+  eq('MAX_COMMIT_BATCH 留了子请求余量（400）', idxSrc.includes('const MAX_COMMIT_BATCH = 400;'), true);
+  // t 稳定是「空转优化」成立的前提，不能退回 Date.now()
+  eq('commit 的 t 取对象真实上传时间', idxSrc.includes('t: obj.uploaded.getTime()'), true);
+  eq(
+    'mkdir 幂等时沿用占位对象的 uploaded',
+    idxSrc.includes('existed ? existed.uploaded.getTime() : Date.now()'),
+    true
+  );
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败\n`);
 process.exit(fail ? 1 : 0);

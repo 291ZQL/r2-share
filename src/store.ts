@@ -150,7 +150,18 @@ async function mutateIndex<T>(
   throw new IndexConflictError(`索引写入冲突：重试 ${INDEX_TRIES} 次仍未成功，请重试`);
 }
 
-/** 新增或更新若干条记录（增量，不重建整个索引） */
+/**
+ * 新增或更新若干条记录（增量，不重建整个索引）。
+ *
+ * dirty 必须「确有变化」才为 true（原来是恒 true）：原样重复提交同一批
+ * ——重复建同名目录、重试一次其实已经成功的 commit——不该白白触发一次
+ * 「读索引 + 写索引」，更不该平白制造一次 CAS 争用（多端同时写时，它正是
+ * 409「索引正被其他请求修改」的来源之一）。
+ *
+ * 判定用逐字段比对 p/s/t/c：全部一致才算无变化。想让这条优化真正生效，
+ * 调用方给出的 t 必须是稳定的——见 src/index.ts：commit 用 obj.uploaded，
+ * mkdir 用占位对象自己的 uploaded，都不是 Date.now()。
+ */
 export async function upsertFiles(
   bucket: R2Bucket,
   entries: FileEntry[]
@@ -162,16 +173,21 @@ export async function upsertFiles(
     index.files.forEach((f, i) => {
       if (!pos.has(f.p)) pos.set(f.p, i);
     });
+    let dirty = false;
     for (const entry of entries) {
       const i = pos.get(entry.p);
       if (i === undefined) {
         pos.set(entry.p, index.files.length);
         index.files.push(entry);
-      } else {
-        index.files[i] = entry;
+        dirty = true;
+        continue;
       }
+      const old = index.files[i];
+      if (old.s === entry.s && old.t === entry.t && old.c === entry.c) continue;
+      index.files[i] = entry;
+      dirty = true;
     }
-    return { out: null, dirty: true };
+    return { out: null, dirty };
   });
 }
 

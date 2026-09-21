@@ -7,6 +7,9 @@
  *   下载文件   : 0 次 Worker（R2 公开桶直链，出口免费）
  *   上传文件   : 数据经 Worker 中转；索引提交按「整批」合并——
  *                1 次批量签名 + N 次写入 + 1 次批量提交（单个文件是 3 次）
+ *                单批超过 MAX_COMMIT_BATCH（400）时由前端分片成多次 sign/commit：
+ *                /api/commit 的子请求数随条数线性增长（N 条 head + 1 读 + 1 写），
+ *                而平台对「内部服务子请求」有 1000 次/请求的硬上限，详见常量处注释
  */
 
 import { Hono } from 'hono';
@@ -82,8 +85,24 @@ app.onError((err, c) => {
   return c.text('Internal Server Error', 500);
 });
 
-/** 单次批量提交索引的条目上限 */
-const MAX_COMMIT_BATCH = 1000;
+/**
+ * 单次批量「签名」的条目上限。
+ * 签名只做 HMAC，不产生任何 R2 子请求，所以可以放到 1000；前端超过这个数会自己分批。
+ */
+const MAX_SIGN_BATCH = 1000;
+/**
+ * 单次批量「提交索引」的条目上限。
+ *
+ * 为什么不是 1000：/api/commit 对每条都要 BUCKET.head 一次校验对象真实存在
+ * （N 个子请求），再调 upsertFiles 做一次「读索引 + 写索引」（2 个子请求），
+ * 合计 N+2 个 R2 子请求。而 Cloudflare 对「内部服务（R2/KV/D1）子请求」有
+ * 每请求 1000 次的硬上限（官方 limits，R2 的 get/put/head/list/delete 全部计入，
+ * 免费与付费同），顶格 1000 条必然超限：签名成功、PUT 成功、提交整批 500，
+ * 而对象其实已经写进桶——用户只看到「上传失败」，是最难排查的一种失败形态。
+ * 取 400（= 402 个子请求）留足余量，也避开「每请求最多 6 条并发连接」让上千个
+ * head 排队；超过 400 的批次由前端分片提交（public/app.js 的 UPLOAD_CHUNK）。
+ */
+const MAX_COMMIT_BATCH = 400;
 /** 单次批量删除的文件数上限（R2 单次 delete 也是 1000 个 key 一批） */
 const MAX_DELETE_BATCH = 1000;
 
@@ -150,10 +169,15 @@ function sweepFails(now: number): void {
   }
 }
 
-/** 清洗前端传来的 MIME：去掉换行/控制字符并限长（/api/sign 与 /api/commit 口径一致） */
+/**
+ * 清洗前端传来的 MIME：去掉全部控制字符（含 CR/LF）并限长。
+ * 三个写入口径必须一致：/api/sign、/api/commit、/api/local-put，
+ * 否则同一份文件在「索引里的 c」与「R2 对象实际的 Content-Type」会分叉。
+ * 注意范围是 \u0000-\u001f\u007f（控制字符全集），不是只去 \r\n —— 注释要和实现对得上。
+ */
 function cleanType(t: unknown): string {
   return String(t || '')
-    .replace(/[\r\n]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
     .slice(0, 200);
 }
 
@@ -204,10 +228,72 @@ app.get('/api/local-get', async (c) => {
   if (!isProxyMode(c.env)) return c.text('生产环境请走 R2 公开桶直链', 400);
   const key = sanitizePath(c.req.query('key'));
   if (!key) return c.text('缺少 key', 400);
-  const obj = await c.env.BUCKET.get(key);
+
+  // 透传 Range：代理模式下大视频/音频要能拖进度条。不处理 Range 的话每次 seek
+  // 浏览器都只能整份重下，等于「视频预览」实际不可用。
+  // 自己解析成 R2 认的 { offset, length } / { suffix }，而不是把整个 headers 丢给 R2：
+  //   ① 多段 ranges（bytes=0-1,5-6）与非法值一律忽略、按整份返回，
+  //      免得 R2 无法解析时抛错，把一次普通的播放请求变成 500；
+  //   ② 不必先 head 一次拿总大小（bytes=N- 这种开放式区间直接给 offset 即可）。
+  const range = (c.req.header('range') || '').trim();
+  const m = /^bytes=(\d*)-(\d*)$/i.exec(range);
+  let ropt: { offset: number; length?: number } | { suffix: number } | undefined;
+  if (m && (m[1] !== '' || m[2] !== '')) {
+    if (m[1] === '') {
+      // bytes=-N：末尾 N 字节
+      const n = parseInt(m[2], 10);
+      if (n > 0) ropt = { suffix: n };
+    } else {
+      const start = parseInt(m[1], 10);
+      ropt =
+        m[2] === ''
+          ? { offset: start } // bytes=N-：到文件末尾，不给 length 就是开放式
+          : { offset: start, length: parseInt(m[2], 10) - start + 1 };
+    }
+  }
+
+  // 区间不可满足时 R2 会直接抛错（实测：对 11 字节的对象求 bytes=100-200 → 500）。
+  // 真实场景会发生——文件被换成更小的版本后，播放器仍可能带着旧 Range 来请求，
+  // 不该因此 500。退回整份返回，语义上等于「忽略 Range」，与多段/非法 Range 一致。
+  let obj: R2ObjectBody | null = null;
+  if (ropt) {
+    try {
+      obj = await c.env.BUCKET.get(key, { range: ropt });
+    } catch {
+      ropt = undefined;
+      obj = await c.env.BUCKET.get(key);
+    }
+  } else {
+    obj = await c.env.BUCKET.get(key);
+  }
   if (!obj) return c.text('文件不存在', 404);
+
   const headers = new Headers();
   obj.writeHttpMetadata(headers);
+  headers.set('accept-ranges', 'bytes');
+
+  // 回不回 206，只看「请求里是否解析出了 Range」（ropt），**不能**看 obj.range：
+  // miniflare 对整份 GET 也会返回 { offset: 0, length: undefined }，靠它判定会把
+  // 普通下载全变成 206（两次实测踩到）。另外 workers-types 把 R2Range 声明成三项
+  // 联合类型、miniflare 的对象又三个键都会存在（值可能是 undefined），所以字段
+  // 既不能直接读（类型不过），也不能用键存在性判断（运行时走错分支）——
+  // 用 unknown 收窄 + typeof 判数值。
+  if (ropt) {
+    const r = obj.range as { offset?: unknown; length?: unknown } | undefined;
+    let start: number;
+    if (typeof r?.offset === 'number') {
+      start = r.offset; // 正常路径：R2 已按对象大小 clamp 过（如 bytes=0-999 截到末尾）
+    } else if ('suffix' in ropt) {
+      start = Math.max(0, obj.size - ropt.suffix); // 元信息拿不到数字时按请求反推
+    } else {
+      start = ropt.offset;
+    }
+    const end = typeof r?.length === 'number' ? start + r.length - 1 : obj.size - 1;
+    headers.set('content-range', `bytes ${start}-${end}/${obj.size}`);
+    headers.set('content-length', String(Math.max(0, end - start + 1)));
+    return new Response(obj.body, { status: 206, headers });
+  }
+
   headers.set('content-length', String(obj.size));
   return new Response(obj.body, { headers });
 });
@@ -230,7 +316,7 @@ app.put('/api/local-put', async (c) => {
   }
 
   // 代理模式下 Content-Type 不参与签名，改由服务端按扩展名决定（更准，见 resolveType）
-  const ctype = resolveType(key, c.req.header('content-type'));
+  const ctype = resolveType(key, cleanType(c.req.header('content-type')));
 
   if (isProxyMode(c.env)) {
     // 本地 miniflare：流式 put 会落盘为 0 字节，只能读进内存再写
@@ -318,8 +404,8 @@ app.post('/api/sign', async (c) => {
   const batch = Array.isArray(body.entries);
   const raw = batch ? (body.entries as unknown[]) : [body];
   if (!raw.length) return c.json({ error: '没有要上传的文件' }, 400);
-  if (raw.length > MAX_COMMIT_BATCH) {
-    return c.json({ error: `一次最多上传 ${MAX_COMMIT_BATCH} 个文件` }, 413);
+  if (raw.length > MAX_SIGN_BATCH) {
+    return c.json({ error: `一次最多上传 ${MAX_SIGN_BATCH} 个文件，请分批` }, 413);
   }
 
   const max = parseInt(c.env.MAX_UPLOAD || '0', 10);
@@ -430,7 +516,6 @@ app.post('/api/commit', async (c) => {
 
   const items: FileEntry[] = [];
   const missing: string[] = [];
-  const now = Date.now();
   for (let i = 0; i < paths.length; i++) {
     const obj = heads[i];
     if (!obj) {
@@ -440,7 +525,12 @@ app.post('/api/commit', async (c) => {
     items.push({
       p: paths[i],
       s: obj.size,
-      t: now,
+      // 用对象在 R2 的真实上传时间，而不是本次 commit 的处理时间：
+      // ① 与 rebuildIndex 的 t 口径一致（那边取的就是 o.uploaded）；
+      // ② t 稳定下来之后，「原样重复提交同一批」在 upsertFiles 里会被判成无变化，
+      //    于是不再写索引 —— 省掉一次读 + 一次写，也少一次 CAS 争用（多端并发时
+      //    它正是 409 的来源之一）。详见 src/store.ts 的 upsertFiles。
+      t: obj.uploaded.getTime(),
       // 与 /api/sign、/api/local-put 同一口径：保证索引里的 MIME 与对象实际存储一致
       c: resolveType(paths[i], cleanType((raw[i] as { type?: string }).type)),
     });
@@ -529,7 +619,8 @@ app.post('/api/mkdir', async (c) => {
 
   // 幂等：对象已存在时也要补写一次索引条目。否则「占位对象在、索引条目丢失」
   // （索引被清空过、或手工删过条目）时，点新建同名目录只返回 ok，目录却始终不显示。
-  if (!(await c.env.BUCKET.head(prefix))) {
+  const existed = await c.env.BUCKET.head(prefix);
+  if (!existed) {
     await c.env.BUCKET.put(prefix, new Uint8Array(0), {
       httpMetadata: { contentType: 'application/octet-stream' },
     });
@@ -539,7 +630,9 @@ app.post('/api/mkdir', async (c) => {
     {
       p: prefix,
       s: 0,
-      t: Date.now(),
+      // 已存在时沿用占位对象的真实上传时间：t 若取 Date.now()，幂等分支每次都会
+      // 被判成「有变化」，upsertFiles 的空转优化就永远不生效。
+      t: existed ? existed.uploaded.getTime() : Date.now(),
       c: 'application/octet-stream',
     },
   ]);

@@ -132,6 +132,14 @@ async function main() {
   ok('中文路径正确保存', idx.files.some((f) => f.p === '_smoke/你好.txt'));
   ok('文件大小已记录', idx.files.find((f) => f.p === '_smoke/data.json')?.s > 0);
 
+  // 空转优化（P3⑩）：原样重复提交同一个文件，不该再产生一次索引写。
+  // 证据用索引的 updated 时间戳 —— 只有真的写了 files.json，它才会变。
+  const u1 = idx.updated;
+  const recommit = await json('/api/commit', { path: '_smoke/你好.txt', type: 'text/plain' });
+  ok('原样重复提交返回 200', recommit.status === 200, `实际 ${recommit.status}`);
+  const u2 = (await (await req('/api/local-index')).json()).updated;
+  ok('原样重复提交不再写索引（updated 未变）', u1 === u2, `实际 ${u1} → ${u2}`);
+
   console.log('\n[批量接口]');
   // 批量上传链路：一次签名 → N 次 PUT → 一次提交索引（前端拖入多个文件时的走法）
   const batchPaths = ['_smoke/b1.txt', '_smoke/b2.txt', '_smoke/b3.txt'];
@@ -203,6 +211,40 @@ async function main() {
 
   const miss = await req('/api/local-get?key=' + encodeURIComponent('不存在的文件.txt'));
   ok('不存在的文件返回 404', miss.status === 404, `实际 ${miss.status}`);
+
+  // Range 透传：代理模式下大视频/音频要能拖进度条（不处理 Range 时每次 seek 整份重下）
+  const KEY = '/api/local-get?key=' + encodeURIComponent('_smoke/你好.txt');
+  const RANGE = (v) => req(KEY, { headers: { range: v } });
+
+  const r1 = await RANGE('bytes=0-4');
+  ok('Range 请求返回 206', r1.status === 206, `实际 ${r1.status}`);
+  ok('Range 回传 content-range', r1.headers.get('content-range') === 'bytes 0-4/11', `实际 ${r1.headers.get('content-range')}`);
+  ok('Range 回传正确切片', (await r1.text()) === 'hello', '正文不是 hello');
+  ok('声明 accept-ranges', r1.headers.get('accept-ranges') === 'bytes', `实际 ${r1.headers.get('accept-ranges')}`);
+
+  const r2 = await RANGE('bytes=6-');
+  ok('开放式 Range（bytes=N-）切片正确', (await r2.text()) === 'world', '正文不是 world');
+  ok('开放式 Range 的 content-range 到末尾', r2.headers.get('content-range') === 'bytes 6-10/11', `实际 ${r2.headers.get('content-range')}`);
+
+  const r3 = await RANGE('bytes=-5');
+  ok('后缀 Range（bytes=-N）切片正确', (await r3.text()) === 'world', '正文不是 world');
+  ok('后缀 Range 的 content-range 正确', r3.headers.get('content-range') === 'bytes 6-10/11', `实际 ${r3.headers.get('content-range')}`);
+
+  const r4 = await RANGE('bytes=0-1,5-6');
+  ok(
+    '多段 Range 被忽略、按整份返回（而不是 500）',
+    r4.status === 200 && r4.headers.get('content-range') === null,
+    `实际 status=${r4.status} content-range=${r4.headers.get('content-range')}`
+  );
+  ok('多段 Range 忽略时正文是完整内容', (await r4.text()) === 'hello world', '正文不完整');
+
+  const r5 = await RANGE('bytes=abc-def');
+  ok('非法 Range 被忽略、按整份返回', r5.status === 200, `实际 ${r5.status}`);
+
+  // 越界区间：R2 会抛「不可满足」，必须退化成整份 200，而不是 500
+  const r6 = await RANGE('bytes=100-200');
+  ok('越界 Range 退化为整份返回、不变成 500', r6.status === 200, `实际 ${r6.status}`);
+  ok('越界 Range 退化后正文是完整内容', (await r6.text()) === 'hello world', '正文不完整');
 
   console.log('\n[页面]');
   const home = await req('/');

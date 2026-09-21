@@ -596,8 +596,15 @@ function bindRowEvents() {
     if (cellEl) {
       // 点击网格单元格空白区：可预览则弹层，否则新窗口打开
       const f = state.index.find((x) => x.p === cellEl.dataset.cell);
-      if (f && previewable(f)) openPreview(f);
-      else window.open(dlUrl(cellEl.dataset.cell), '_blank');
+      if (f && previewable(f)) {
+        openPreview(f);
+      } else {
+        // dlUrl 在「生产但未配下载域」时回退成 '#'；直接打开 '#' 会多出一个空白标签页，
+        // 还会往当前页地址里塞个 #，所以拦住并说清原因。
+        const url = dlUrl(cellEl.dataset.cell);
+        if (url && url !== '#') window.open(url, '_blank');
+        else toast('未配置下载域名，无法直接打开', 'err');
+      }
     }
   });
 
@@ -698,9 +705,16 @@ async function batchCopy() {
 }
 
 function batchDownload() {
-  const paths = [...state.sel];
-  if (!paths.length) return;
-  // 不能用 window.open 循环：浏览器弹窗拦截器只放行第一个，后面的全被吞掉，
+  // 未配置下载域时 dlUrl 会回退成 '#'，直接剔掉：否则「批量下载」会去下载当前页面
+  const paths = [...state.sel].filter((p) => {
+    const u = dlUrl(p);
+    return !!u && u !== '#';
+  });
+  if (!paths.length) {
+    toast('没有可下载的链接（未配置下载域名）', 'err');
+    return;
+  }
+  // 弹窗拦截器只放行用户手势里的第一个 window.open，循环调用会被吞掉，
   // 表现就是「批量下载明明选了 N 个却只下了一个」。改成依次触发 <a download>，
   // 同一个用户手势内的程序化点击不会触发拦截，间隔留一点让浏览器排队。
   if (paths.length > 5) {
@@ -708,9 +722,14 @@ function batchDownload() {
   }
   paths.forEach((p, i) => {
     setTimeout(() => {
+      const url = dlUrl(p);
       const a = document.createElement('a');
-      a.href = dlUrl(p);
-      a.download = p.split('/').pop() || 'file';
+      a.href = url;
+      // a.download 对**跨域**直链会被浏览器忽略，文件名改由 URL 末段决定。
+      // 生产环境 URL 末段就是真实文件名，所以看着「生效」了，其实这行没起作用；
+      // 只有同源地址（代理模式的 /api/local-get?key=…）才真认它。
+      // 因此只在同源时设置，别留一个看着有用、实则无效的赋值误导后来人。
+      if (url.startsWith('/')) a.download = p.split('/').pop() || 'file';
       a.rel = 'noopener';
       document.body.appendChild(a);
       a.click();
@@ -738,12 +757,15 @@ async function batchDelete() {
     body: JSON.stringify({ paths }),
   });
   const data = await res.json().catch(() => ({}));
-  state.sel.clear();
-  updateBatch();
   if (res.ok) {
+    state.sel.clear();
+    updateBatch();
     toast(`已删除 ${data.removed || 0}/${n}`);
     dropIndexPaths(paths);
   } else {
+    // 失败时保留选择：清空会让用户以为「这批已经处理完了」，想重试还得一个个重新勾。
+    // 服务端要么整批成功、要么整批拒绝（路径非法直接 400），没有部分成功的中间态，
+    // 所以「失败就原样保留」是准确语义。
     toast(data.error || '删除失败', 'err');
   }
 }
@@ -935,13 +957,27 @@ function applyIndexEntries(entries) {
   render();
 }
 
-/** 从本地索引移除若干路径（目录按前缀一并移除）并重绘 */
+/**
+ * 从本地索引移除若干路径（目录按前缀一并移除）并重绘。
+ *
+ * 命中判定不能写成「对每个索引条目遍历一遍 paths」（相当于
+ * `paths.some((p) => f.p.startsWith(p + '/'))`）：批量删 1000 个文件时那是 O(N×M)，
+ * 上百万次字符串比较，页面会卡住。改成先把待删目录收成集合，再沿 '/' 逐级
+ * 回退查祖先 —— O(N × 路径深度)。两种写法语义完全一致：
+ * 精确命中、或任一层祖先目录命中，都算要移除。
+ */
 function dropIndexPaths(paths) {
   if (!paths || !paths.length) return;
   const exact = new Set(paths);
-  state.index = state.index.filter(
-    (f) => !exact.has(f.p) && !paths.some((p) => f.p.startsWith(p + '/'))
-  );
+  const dirs = new Set();
+  for (const p of paths) dirs.add(p + '/');
+  state.index = state.index.filter((f) => {
+    if (exact.has(f.p)) return false;
+    for (let i = f.p.lastIndexOf('/'); i >= 0; i = f.p.lastIndexOf('/', i - 1)) {
+      if (dirs.has(f.p.slice(0, i + 1))) return false;
+    }
+    return true;
+  });
   render();
 }
 
@@ -954,6 +990,9 @@ async function loadIndex() {
     return;
   }
   try {
+    // cache:'no-store' 只让**浏览器**不吃本地缓存；files.json 对象本身带
+    // Cache-Control: public, max-age=10（store.ts 的 INDEX_META），CDN 层最多再缓存 10 秒。
+    // 日常上传/删除靠本地增量更新立即可见，这里只在「首次加载 / 重建索引 / 回首页」才拉整份。
     const res = await fetch(url, { cache: 'no-store' });
     const data = await res.json();
     state.index = Array.isArray(data.files) ? data.files : [];
@@ -1083,35 +1122,58 @@ function markFail(j, msg) {
 }
 
 /**
- * 批量上传：一次签名 → 并发 PUT → 一次提交索引。
- * 两个控制步骤都按「整批」合并，只有真正的数据传输（PUT）按并发池展开。
+ * 单次批量请求（签名 / 提交索引）的条目上限。
+ *
+ * 必须与服务端 src/index.ts 的 MAX_COMMIT_BATCH 对齐，理由那边写得很细：
+ * /api/commit 每一条都要一次 R2 head，再加索引的读 + 写，N 条就是 N+2 个子请求，
+ * 而平台对「内部服务子请求」有 1000 次/请求的硬上限。前端只负责把大批判小，
+ * 真正的守门人仍是服务端常量（超了会返回 413）。
+ * test-frontend.mjs 有一条断言钉住「前端分批 ≤ 服务端 MAX_COMMIT_BATCH」。
+ */
+const UPLOAD_CHUNK = 400;
+
+/** 把数组切成每块不超过 size 的若干块（size 非正数时原样返回一块） */
+function chunk(arr, size) {
+  if (!(size > 0)) return [arr];
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/**
+ * 批量上传：分批签名 → 并发 PUT → 分批提交索引。
+ * 两个控制步骤都按「整批」合并，只有真正的数据传输（PUT）按并发池展开；
+ * 整批超过 UPLOAD_CHUNK 时才拆成多次——一次拖入上千个文件必须在这里拆开，
+ * 否则服务端按上限整批 413，连签名都拿不到。
  */
 async function runBatchUpload(jobs) {
-  // 1) 一次性签名（N 次请求压成 1 次）
+  // 1) 分批签名（每批把 N 次请求压成 1 次）
   try {
-    const res = await fetch('/api/sign', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        entries: jobs.map((j) => ({
-          path: j.path,
-          size: j.file.size,
-          // 统一小写：SigV4 签名会对 Content-Type 做 toLowerCase（sigv4.ts），
-          // 大小写不一致会让 R2 判签名不匹配返回 403
-          type: (j.file.type || 'application/octet-stream').toLowerCase(),
-        })),
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || '签名失败');
-    const signed = Array.isArray(data.items) ? data.items : [];
-    if (signed.length !== jobs.length) throw new Error('签名结果数量不匹配');
-    jobs.forEach((j, i) => {
-      j.url = signed[i].url;
-      // 优先用服务端回传的 ctype：它按扩展名归一（浏览器给不出 7z/dmg/apk 的 MIME），
-      // 且 presigned 模式下就是签名用的值，必须与 PUT 头完全一致否则 403
-      j.ctype = signed[i].ctype || (j.file.type || 'application/octet-stream').toLowerCase();
-    });
+    for (const part of chunk(jobs, UPLOAD_CHUNK)) {
+      const res = await fetch('/api/sign', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          entries: part.map((j) => ({
+            path: j.path,
+            size: j.file.size,
+            // 统一小写：SigV4 签名会对 Content-Type 做 toLowerCase（sigv4.ts），
+            // 大小写不一致会让 R2 判签名不匹配返回 403
+            type: (j.file.type || 'application/octet-stream').toLowerCase(),
+          })),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '签名失败');
+      const signed = Array.isArray(data.items) ? data.items : [];
+      if (signed.length !== part.length) throw new Error('签名结果数量不匹配');
+      part.forEach((j, i) => {
+        j.url = signed[i].url;
+        // 优先用服务端回传的 ctype：它按扩展名归一（浏览器给不出 7z/dmg/apk 的 MIME），
+        // 且 presigned 模式下就是签名用的值，必须与 PUT 头完全一致否则 403
+        j.ctype = signed[i].ctype || (j.file.type || 'application/octet-stream').toLowerCase();
+      });
+    }
   } catch (err) {
     for (const j of jobs) markFail(j, err.message || '签名失败');
     return;
@@ -1120,26 +1182,29 @@ async function runBatchUpload(jobs) {
   // 2) 并发 PUT（只有这一步在传数据）
   await pool(jobs, 4, (j) => putJob(j));
 
-  // 3) 提交索引：只提交 PUT 成功的，整批一次
+  // 3) 分批提交索引：只提交 PUT 成功的。每批独立 try/catch，
+  //    某一批索引写入失败不会把已经成功的其他批也标红（旧版是整批一起标红）。
   const done = jobs.filter((j) => j.ok);
   if (!done.length) return;
-  try {
-    const res = await fetch('/api/commit', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ entries: done.map((j) => ({ path: j.path, type: j.ctype })) }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || '索引写入失败');
-    const missing = new Set(Array.isArray(data.missing) ? data.missing : []);
-    for (const j of done) {
-      if (missing.has(j.path)) markFail(j, '对象未落盘');
-      else markDone(j);
+  for (const part of chunk(done, UPLOAD_CHUNK)) {
+    try {
+      const res = await fetch('/api/commit', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ entries: part.map((j) => ({ path: j.path, type: j.ctype })) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '索引写入失败');
+      const missing = new Set(Array.isArray(data.missing) ? data.missing : []);
+      for (const j of part) {
+        if (missing.has(j.path)) markFail(j, '对象未落盘');
+        else markDone(j);
+      }
+      // 索引就地增量更新，不再为一次上传重新下载整份 files.json
+      applyIndexEntries(data.entries);
+    } catch (err) {
+      for (const j of part) markFail(j, err.message || '索引写入失败');
     }
-    // 索引就地增量更新，不再为一次上传重新下载整份 files.json
-    applyIndexEntries(data.entries);
-  } catch (err) {
-    for (const j of done) markFail(j, err.message || '索引写入失败');
   }
 }
 
