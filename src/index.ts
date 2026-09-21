@@ -20,6 +20,12 @@ import {
   SESSION_COOKIE,
 } from './auth';
 import {
+  isProxyMode,
+  isUploadProxy,
+  hasSessionKey,
+  sessionSecretOf,
+} from './mode';
+import {
   sanitizePath,
   IndexConflictError,
   upsertFiles,
@@ -32,6 +38,12 @@ import {
   type FileEntry,
 } from './store';
 
+/**
+ * Worker 运行时可见的环境变量。
+ * 与「运行模式判定」相关的那几个（DL_DOMAIN / LOCAL_MODE / UPLOAD_VIA_WORKER /
+ * ADMIN_PASSWORD / SESSION_SECRET）在 src/mode.ts 里有对应的结构化声明 ModeEnv，
+ * 判据逻辑与测试都在那边。
+ */
 export interface Env {
   BUCKET: R2Bucket;
   ASSETS: Fetcher;
@@ -42,11 +54,17 @@ export interface Env {
   BUCKET_NAME: string;
   /** '1' 时生产环境上传改走 Worker 代理（绕开被墙的 r2.cloudflarestorage.com 直传） */
   UPLOAD_VIA_WORKER: string;
+  /** '1' 强制本地代理模式 / '0' 强制生产模式；不设则由 DL_DOMAIN 是否为合法 URL 推断 */
+  LOCAL_MODE: string;
   ADMIN_PASSWORD: string;
+  /** 选填：不设则从 ADMIN_PASSWORD 派生（见 sessionSecretOf），部署时少配一个密钥 */
   SESSION_SECRET: string;
+  /** 选填：仅当关闭 Worker 中转（UPLOAD_VIA_WORKER=0）走 presigned 直传时才需要 */
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
+  /** 选填：S3 端点就是 <account_id>.r2.cloudflarestorage.com，可与 CLOUDFLARE_ACCOUNT_ID 同值 */
   R2_ACCOUNT_ID: string;
+  CLOUDFLARE_ACCOUNT_ID: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -69,11 +87,14 @@ const MAX_COMMIT_BATCH = 1000;
 /** 单次批量删除的文件数上限（R2 单次 delete 也是 1000 个 key 一批） */
 const MAX_DELETE_BATCH = 1000;
 
-/** 判断当前请求是否已登录 */
+/**
+ * 判断当前请求是否已登录。
+ * 会话密钥与「是否具备密钥来源」的判定都在 src/mode.ts（抽出去是为了可离线测试）。
+ */
 async function isLogin(c: any): Promise<boolean> {
-  const secret = c.env.SESSION_SECRET;
-  if (!secret) return false;
-  return verifySession(secret, getCookie(c, SESSION_COOKIE));
+  // 两个来源都没配时，派生结果是个公开常量，不能当有效密钥 → 一律判未登录
+  if (!hasSessionKey(c.env)) return false;
+  return verifySession(await sessionSecretOf(c.env), getCookie(c, SESSION_COOKIE));
 }
 
 /* ---------------- 登录失败限流 ----------------
@@ -148,30 +169,9 @@ function clientIP(c: any): string {
 
 /* ---------------- 页面 ---------------- */
 
-/**
- * 是否为本地开发模式：没有配置 R2 的 S3 凭证时，
- * presigned 直传与公开桶直链都不可用，自动回退到 Worker 代理。
- * 该标记同时传给前端（CFG.local），控制下载/索引走本地代理路由。
- */
-function isLocal(c: any): boolean {
-  return (
-    !c.env.R2_ACCESS_KEY_ID ||
-    !c.env.R2_SECRET_ACCESS_KEY ||
-    !c.env.R2_ACCOUNT_ID ||
-    !c.env.BUCKET_NAME
-  );
-}
-
-/**
- * 上传是否走 Worker 代理：
- * - 本地开发（unconfigured R2）或
- * - 生产显式设置 UPLOAD_VIA_WORKER='1'
- * 区别于 isLocal：此标记只决定「上传」走 Worker 中转（env.BUCKET.put），
- * 下载仍走公开桶直链，避免 r2.cloudflarestorage.com 被墙时上传不可用。
- */
-function isUploadProxy(c: any): boolean {
-  return isLocal(c) || c.env.UPLOAD_VIA_WORKER === '1';
-}
+/* 运行模式判定（isProxyMode / isUploadProxy）与会话密钥派生都在 src/mode.ts：
+ * 那里零依赖、可被 scripts/test-mode.mjs 直接 import 做离线单测，
+ * 判据为什么这么定（不看 R2 凭证、只看公开桶下载域）也一并写在那个文件里。 */
 
 app.get('/', async (c) => {
   const login = await isLogin(c);
@@ -180,26 +180,28 @@ app.get('/', async (c) => {
       siteName: c.env.SITE_NAME || '我的仓库',
       dlDomain: c.env.DL_DOMAIN || '',
       isLogin: login,
-      local: isLocal(c),
+      proxyMode: isProxyMode(c.env),
     })
   );
 });
 
-/* ---------------- 本地开发回退路由 ----------------
- * /api/local-index 与 /api/local-get 仅当未配置 R2 S3 凭证时可用（wrangler dev 本地验证）；
- * /api/local-put 例外：生产开启 UPLOAD_VIA_WORKER=1 时作为上传主路径（见 isUploadProxy）。
+/* ---------------- Worker 代理路由（路径里的 local- 是历史命名，语义见下） ----------------
+ * /api/local-index 与 /api/local-get 仅在「代理模式」（isProxyMode：没配公开桶下载域
+ * DL_DOMAIN）下可用，供 wrangler dev / 纯本地验证；生产配好 DL_DOMAIN 后自动返回 400。
+ * /api/local-put 是例外：生产开启 UPLOAD_VIA_WORKER=1 时它就是上传主路径（见 isUploadProxy）。
  * 生产环境的下载与索引始终走 R2 公开桶直链（DL_DOMAIN），不经过这里。
+ * 路径名保留 local- 前缀是为了不动前端与冒烟脚本的既有契约。
  */
 
 app.get('/api/local-index', async (c) => {
-  if (!isLocal(c)) return c.text('生产环境请直接读取公开桶的 files.json', 400);
+  if (!isProxyMode(c.env)) return c.text('生产环境请直接读取公开桶的 files.json', 400);
   // 复用 readIndex 的容灾语义：索引不存在或损坏时返回空索引，可用 /api/refresh 重建
   const idx = await readIndex(c.env.BUCKET);
   return c.json(idx);
 });
 
 app.get('/api/local-get', async (c) => {
-  if (!isLocal(c)) return c.text('生产环境请走 R2 公开桶直链', 400);
+  if (!isProxyMode(c.env)) return c.text('生产环境请走 R2 公开桶直链', 400);
   const key = sanitizePath(c.req.query('key'));
   if (!key) return c.text('缺少 key', 400);
   const obj = await c.env.BUCKET.get(key);
@@ -211,7 +213,7 @@ app.get('/api/local-get', async (c) => {
 });
 
 app.put('/api/local-put', async (c) => {
-  if (!isUploadProxy(c)) {
+  if (!isUploadProxy(c.env)) {
     return c.text('上传代理未启用，请配置 UPLOAD_VIA_WORKER=1 或使用 presigned 直传', 400);
   }
   if (!(await isLogin(c))) return c.json({ error: '未登录' }, 401);
@@ -230,7 +232,7 @@ app.put('/api/local-put', async (c) => {
   // 代理模式下 Content-Type 不参与签名，改由服务端按扩展名决定（更准，见 resolveType）
   const ctype = resolveType(key, c.req.header('content-type'));
 
-  if (isLocal(c)) {
+  if (isProxyMode(c.env)) {
     // 本地 miniflare：流式 put 会落盘为 0 字节，只能读进内存再写
     const body = await c.req.arrayBuffer();
     await c.env.BUCKET.put(key, body, { httpMetadata: { contentType: ctype } });
@@ -272,7 +274,8 @@ app.post('/api/login', async (c) => {
 
   clearFail(ip);
   const days = parseInt(c.env.SESSION_DAYS || '30', 10) || 30;
-  const token = await createSession(c.env.SESSION_SECRET, days);
+  // 与 isLogin 用同一个派生函数，保证「签发」与「校验」两侧密钥一致
+  const token = await createSession(await sessionSecretOf(c.env), days);
   const secure = new URL(c.req.url).protocol === 'https:';
 
   setCookie(c, SESSION_COOKIE, token, {
@@ -339,24 +342,41 @@ app.post('/api/sign', async (c) => {
   // 上传走 Worker 代理：本地开发或生产开启 UPLOAD_VIA_WORKER=1。
   // 生产场景为避免 r2.cloudflarestorage.com 被墙（ERR_ADDRESS_UNREACHABLE），
   // 上传目标改为本 Worker 的同源 /api/local-put（浏览器无需 CORS、不依赖被墙端点）。
-  if (isUploadProxy(c)) {
+  if (isUploadProxy(c.env)) {
     const items = jobs.map(({ path, ctype }) => ({
       path,
       url: `/api/local-put?key=${encodeURIComponent(path)}`,
       ctype,
     }));
     if (!batch) {
+      // 响应字段名沿用 local（既有契约），语义同 isUploadProxy
       return c.json({ ok: true, url: items[0].url, key: items[0].path, ctype: items[0].ctype, local: true });
     }
     return c.json({ ok: true, items, local: true });
   }
 
-  const cred = {
-    accessKeyId: c.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: c.env.R2_SECRET_ACCESS_KEY,
-    accountId: c.env.R2_ACCOUNT_ID,
-    bucket: c.env.BUCKET_NAME,
-  };
+  // 走到这里说明上传走 presigned 直传（UPLOAD_VIA_WORKER != '1'），必须有 S3 凭证。
+  // 凭证本身是选填项（代理上传用不到），因此缺了要给出可操作的报错，
+  // 而不是让浏览器在 PUT 时吃一个语焉不详的 403。
+  const accessKeyId = c.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = c.env.R2_SECRET_ACCESS_KEY;
+  // S3 端点即 <account_id>.r2.cloudflarestorage.com，两个名字同值，所以允许只配一个。
+  // 正常路径是 CI 的 sync 步骤把 CLOUDFLARE_ACCOUNT_ID 的值写进 R2_ACCOUNT_ID 这个
+  // secret（见 .github/workflows/deploy.yml）；后面的 CLOUDFLARE_ACCOUNT_ID 只是兜底，
+  // 仅当有人手动把它也配成 Worker 变量时才取得到——Worker 运行时不会自带这个名字。
+  const accountId = c.env.R2_ACCOUNT_ID || c.env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accessKeyId || !secretAccessKey || !accountId) {
+    return c.json(
+      {
+        error:
+          '未配置 R2 S3 凭证，无法使用 presigned 直传。' +
+          '请设置 UPLOAD_VIA_WORKER=1 改走 Worker 中转，或补齐 R2_ACCESS_KEY_ID / ' +
+          'R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID',
+      },
+      500
+    );
+  }
+  const cred = { accessKeyId, secretAccessKey, accountId, bucket: c.env.BUCKET_NAME };
   const items = await Promise.all(
     jobs.map(async ({ path, ctype }) => ({
       path,

@@ -18,12 +18,16 @@ export interface RenderOptions {
   siteName: string;
   dlDomain: string;
   isLogin: boolean;
-  /** 本地开发标记：未配置 R2 凭证时，读写改走 Worker 代理 */
-  local: boolean;
+  /**
+   * 代理模式标记（对应 mode.ts 的 isProxyMode）：为 true 时下载/索引改走本 Worker 的
+   * 代理路由，而不是公开桶直链。判据是「有没有配公开桶下载域 DL_DOMAIN」，
+   * 与 R2 S3 凭证是否配置无关。
+   */
+  proxyMode: boolean;
 }
 
 export function renderIndex(opts: RenderOptions): string {
-  const { siteName, dlDomain, isLogin, local } = opts;
+  const { siteName, dlDomain, isLogin, proxyMode } = opts;
   const safeName = esc(siteName);
 
   return `<!DOCTYPE html>
@@ -176,7 +180,7 @@ export function renderIndex(opts: RenderOptions): string {
     siteName,
     dlDomain,
     isLogin,
-    local,
+    proxyMode,
   })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')

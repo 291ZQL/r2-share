@@ -226,9 +226,9 @@ function renderCrumb() {
   });
 }
 
-/** 本地开发（未配 R2 凭证）时改走 Worker 代理，生产环境直连公开桶 */
+/** 代理模式（未配公开桶下载域 DL_DOMAIN）时改走 Worker 代理，否则直连公开桶 */
 function dlUrl(path) {
-  if (CFG.local) return '/api/local-get?key=' + encodeURIComponent(path);
+  if (CFG.proxyMode) return '/api/local-get?key=' + encodeURIComponent(path);
   // 生产但未配置下载域：直链不可用，返回 #（点击无操作），
   // 避免拼出 "undefined/xxx" 的坏链接误导用户以为下载坏了
   if (!CFG.dlDomain) return '#';
@@ -236,7 +236,7 @@ function dlUrl(path) {
 }
 
 function idxUrl() {
-  if (CFG.local) return '/api/local-index';
+  if (CFG.proxyMode) return '/api/local-index';
   // 未配置下载域时索引也无法获取；返回空让 loadIndex 走容灾分支
   return CFG.dlDomain ? CFG.dlDomain + '/files.json' : '';
 }
@@ -397,8 +397,8 @@ function renderOfficePreview(body, name, url) {
   const label =
     { doc: 'Word', docx: 'Word', xls: 'Excel', xlsx: 'Excel', ppt: 'PowerPoint', pptx: 'PowerPoint' }[ext] ||
     'Office';
-  // 在线查看要求文件能被公网访问：本地代理地址（/api/local-get?...）不行
-  const canOnline = !CFG.local && /^https?:\/\//i.test(url);
+  // 在线查看要求文件能被公网访问：Worker 代理地址（/api/local-get?...）不行
+  const canOnline = !CFG.proxyMode && /^https?:\/\//i.test(url);
 
   body.innerHTML = `<div class="pv-office">
     <div class="of-ic">${icon(name, false)}</div>

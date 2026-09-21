@@ -29,19 +29,44 @@ try {
   process.exit(1);
 }
 
-// 2. wrangler.toml
-section('2. wrangler.toml');
-const toml = await readFile('wrangler.toml', 'utf8');
+// 2. 部署配置 —— 优先校验 gen-config 的生成物（含真实域名），否则退回模板
+section('2. 部署配置');
+const hasDeployCfg = existsSync('wrangler.deploy.toml');
+const cfgPath = hasDeployCfg ? 'wrangler.deploy.toml' : 'wrangler.toml';
+const toml = await readFile(cfgPath, 'utf8');
+if (hasDeployCfg) ok(`读取生成后的配置 ${cfgPath}`);
+else warn('未找到 wrangler.deploy.toml（尚未生成）——本次校验的是模板，域名等项会被判为未就绪');
+
+// 模板占位符未替换 = 域名没配。这是 fork 后最危险的「静默跑偏」：
+// 不拦下来的话，站点会带着作者的域名上线（下载直链指向作者的 R2 桶）。
+// 只查真实 token，避免误伤模板头部注释里提到的 __TOKEN__。
+const leftover = toml.match(/__(?:BUCKET_NAME|DL_DOMAIN|SITE_NAME|WORKER_DOMAIN)__/g);
+if (leftover) {
+  err(
+    `${cfgPath} 仍有未替换的占位符：${[...new Set(leftover)].join(', ')}\n` +
+      '     先运行 `npm run gen-config`（配置 WORKER_DOMAIN / DL_DOMAIN 后）再部署'
+  );
+}
+
+// 自定义域路由：必须存在，且是 custom_domain（zone_name 传统路由在 assets 模式下易 522）
+const routeMatch = toml.match(/\[\[routes\]\][\s\S]*?pattern\s*=\s*"([^"]+)"/);
+if (!routeMatch) {
+  err('缺少 [[routes]] pattern：Worker 未绑定自定义域（只会有 workers.dev 子域）');
+} else if (!/custom_domain\s*=\s*true/.test(toml)) {
+  warn('[[routes]] 未使用 custom_domain = true：zone_name 传统路由在 assets 模式下易触发 522 回源超时');
+} else {
+  ok(`Worker 自定义域 = ${routeMatch[1]}`);
+}
 
 const bucketMatch = toml.match(/bucket_name\s*=\s*"([^"]+)"/);
 if (bucketMatch) ok('R2 bucket_name = ' + bucketMatch[1]);
-else err('wrangler.toml 缺少 R2 bucket_name');
+else err(`${cfgPath} 缺少 R2 bucket_name`);
 
 if (/DL_DOMAIN\s*=\s*"https?:\/\/[^"]+"/.test(toml)) {
   const dl = toml.match(/DL_DOMAIN\s*=\s*"([^"]+)"/)[1];
   ok('DL_DOMAIN = ' + dl);
 } else {
-  err('DL_DOMAIN 未设置或格式异常（应形如 https://dl.114448.xyz）');
+  err('DL_DOMAIN 未设置或格式异常（应形如 https://dl.example.com）');
 }
 
 // 首页必须显式走 Worker：否则请求会先找同名静态文件，一旦 public/ 出现 index.html，
@@ -68,6 +93,18 @@ if (/\[\[kv_namespaces\]\]/.test(toml)) {
   warn('wrangler.toml 仍保留 [[kv_namespaces]]，但代码已改用内存限流——可以删掉这个绑定');
 }
 
+// 上传模式与凭证的匹配关系：
+//   UPLOAD_VIA_WORKER=1 → 走 Worker 中转，完全不碰 S3，无需任何 R2 凭证；
+//   UPLOAD_VIA_WORKER=0 → 浏览器直传 R2，必须配齐 S3 凭证，否则上传在签名阶段就 500。
+const upw = toml.match(/UPLOAD_VIA_WORKER\s*=\s*"([^"]*)"/);
+if (upw?.[1] === '1') {
+  ok('UPLOAD_VIA_WORKER = 1（上传走 Worker 中转，无需 R2 S3 凭证）');
+} else if (upw) {
+  warn('UPLOAD_VIA_WORKER 未开启：上传走 presigned 直传，必须配好 R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / 账户 id，否则上传必然失败');
+} else {
+  warn('未设置 UPLOAD_VIA_WORKER：将走 presigned 直传，需自行确保 R2 S3 凭证齐备且端点可达');
+}
+
 // 3. .dev.vars（本地开发）
 section('3. .dev.vars');
 if (!existsSync('.dev.vars')) {
@@ -88,7 +125,8 @@ if (!existsSync('.dev.vars')) {
 
   const secMatch = dev.match(/^SESSION_SECRET\s*=\s*(.+)$/m);
   if (!secMatch) {
-    err('SESSION_SECRET 未设置');
+    // 未配置不再是错误：运行时从 ADMIN_PASSWORD 确定性派生（见 src/mode.ts sessionSecretOf）
+    ok('SESSION_SECRET 未设置——将自动从 ADMIN_PASSWORD 派生（换口令会失效所有旧会话）');
   } else if (['change-me', 'random-long-string-please-change', 'local-dev-secret-please-change', ''].includes(secMatch[1].trim())) {
     warn('SESSION_SECRET 是示例值，生产前请用 `openssl rand -hex 32` 重新生成');
   } else if (secMatch[1].trim().length < 32) {
@@ -97,22 +135,23 @@ if (!existsSync('.dev.vars')) {
     ok('SESSION_SECRET 已设置（长度 ' + secMatch[1].trim().length + '）');
   }
 
-  // 生产 secrets 提醒
+  // R2 S3 凭证是选填项：只有关闭 Worker 中转（UPLOAD_VIA_WORKER=0）走 presigned 直传才需要
   const hasR2 = /^R2_ACCESS_KEY_ID\s*=/.test(dev) && /^R2_SECRET_ACCESS_KEY\s*=/.test(dev);
   if (hasR2) {
-    ok('R2 S3 API 凭证已配置——本地 dev 会使用真实 R2（不再是回退模式）');
+    ok('R2 S3 API 凭证已配置——可用于 presigned 直传');
   } else {
-    ok('R2 S3 API 凭证未配置——本地 dev 自动走回退模式（适合纯前端调试）');
+    ok('R2 S3 API 凭证未配置——上传走 Worker 中转（默认模式），无需配置');
   }
 }
 
-// 4. cors.json
-section('4. cors.json');
+// 4. cors（优先校验生成的 cors.deploy.json，否则退回模板 cors.json）
+const corsPath = existsSync('cors.deploy.json') ? 'cors.deploy.json' : 'cors.json';
+section('4. ' + corsPath);
 let cors;
 try {
-  cors = JSON.parse(await readFile('cors.json', 'utf8'));
+  cors = JSON.parse(await readFile(corsPath, 'utf8'));
 } catch (e) {
-  err('cors.json 不是合法 JSON：' + e.message);
+  err(corsPath + ' 不是合法 JSON：' + e.message);
 }
 
 if (cors) {
@@ -123,9 +162,17 @@ if (cors) {
   if (!Array.isArray(origins)) {
     err('cors.json 结构异常：缺少 rules[].allowed.origins 数组（R2 API 格式见 https://developers.cloudflare.com/r2/buckets/cors/）');
   } else {
-    const placeholders = origins.filter((o) => /<[^>]+>|TODO|FIXME|pan\.114448/.test(o));
+    const placeholders = origins.filter((o) =>
+      /<[^>]+>|__[A-Z_]+__|TODO|FIXME/i.test(o)
+    );
     if (placeholders.length) {
-      err('cors.json 仍有未替换的占位符 origin：' + placeholders.join(', ') + '\n     流程：首次 wrangler deploy → 拿到 Worker 实际 URL → 替换 cors.json → wrangler r2 bucket cors set r2share --file cors.json');
+      err(
+        `${corsPath} 仍有未替换的占位符 origin：${placeholders.join(', ')}\n` +
+          '     先运行 `npm run gen-config` 生成 cors.deploy.json（会按 WORKER_DOMAIN 填好 origin），再执行：\n' +
+          '     npx wrangler r2 bucket cors set <BUCKET_NAME> --file cors.deploy.json\n' +
+          '     （GitHub Actions 部署时只有 UPLOAD_VIA_WORKER=0 的直传模式会自动跑这一步，\n' +
+          '      默认的 Worker 代理模式同源上传、用不到 CORS，所以这里不阻断）'
+      );
     } else if (origins.length === 0) {
       err('cors.json allowed.origins 为空，浏览器无法上传');
     } else if (origins.includes('*')) {

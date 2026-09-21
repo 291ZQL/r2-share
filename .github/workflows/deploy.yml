@@ -1,17 +1,37 @@
 # r2share 一键部署：push main = 自动发布到 Cloudflare Workers
 #
-# 前置条件 — 在仓库 Settings → Secrets and variables → Actions 配置：
-#   CLOUDFLARE_API_TOKEN   带 Workers Scripts Edit + R2 权限的 API Token
-#   CLOUDFLARE_ACCOUNT_ID  账户 id（32 位十六进制）
-#   ADMIN_PASSWORD        管理口令（同步为 Worker secret）
-#   SESSION_SECRET         会话签名密钥（同步为 Worker secret）
-#   R2_ACCESS_KEY_ID       R2 S3 API 令牌（同步为 Worker secret）
-#   R2_SECRET_ACCESS_KEY   R2 S3 API 令牌（同步为 Worker secret）
-#   R2_ACCOUNT_ID          R2 S3 API 令牌（同步为 Worker secret）
+# ── 需要配置的东西：2 个必填 Variable + 2 个必填 Secret ──────────────────────
 #
-# 与手动 wrangler 部署的取舍：本流水线把 GitHub Secrets 当作权威来源，每次部署
-# 都会用它的值覆盖 Cloudflare 端同名 secret——因此 GitHub 里的值必须与生产一致，
-# 改 secret 请先在 GitHub 修改再重跑，不要只改 CF 控制台。
+# Settings → Secrets and variables → Actions → **Variables**（非敏感，明文可见，推荐放这里）
+#   WORKER_DOMAIN           【必填】站点入口域，如 file.example.com（不带 http://）
+#   DL_DOMAIN               【必填】R2 下载直链域，如 dl.example.com 或 <id>.r2.dev
+#   CLOUDFLARE_ACCOUNT_ID   选填，账户 id（32 位十六进制）；只关联一个账户时可留空
+#   BUCKET_NAME             选填，R2 桶名（默认 r2share）
+#   SITE_NAME               选填，站点名称（默认 我的仓库）
+#
+# Settings → Secrets and variables → Actions → **Secrets**（敏感，加密存储）
+#   CLOUDFLARE_API_TOKEN    【必填】带 Workers Scripts Edit + R2 权限的 API Token
+#                           （R2 权限只在直传模式下会被用到——那时流水线要自动应用桶 CORS）
+#   ADMIN_PASSWORD          【必填】管理口令
+#   以下均可留空，留空即用自动推导 / 默认行为：
+#   SESSION_SECRET          会话签名密钥。留空 → 从 ADMIN_PASSWORD 派生
+#   R2_ACCESS_KEY_ID        仅当 UPLOAD_VIA_WORKER=0 走 presigned 直传时才需要
+#   R2_SECRET_ACCESS_KEY    同上
+#   R2_ACCOUNT_ID           留空 → 复用 CLOUDFLARE_ACCOUNT_ID（S3 端点同值）
+#
+# 流水线顺序：Validate（必填项 fail-fast）→ Deploy → Sync secrets → Apply CORS（仅直传模式）
+# 三步都在同一个 job 里，gen-config 产出的 wrangler.deploy.toml / cors.deploy.json 会留给后续步骤读。
+#
+# 两类变量都支持：同名配置会优先读 Variables，其次读 Secrets（向后兼容）。
+# 域名、桶名这些不是密钥，放 Variables 的好处是随时可见、可改，不用「重新输入才看得到」。
+#
+# WORKER_DOMAIN / DL_DOMAIN 是硬性必填：它们只在部署时由 scripts/gen-config.mjs 注入
+# 生成的 wrangler.deploy.toml，缺失会让 gen-config 退出码 1、部署中止——
+# 这样别人 fork 后不可能「带着作者的域名」静默上线。
+#
+# 与手动 wrangler 部署的取舍：本流水线把这里当作权威来源，每次部署都会用它的值
+# 覆盖 Cloudflare 端同名 secret——因此仓库里的值必须与生产一致，改 secret 请先在这里
+# 修改再重跑，不要只改 CF 控制台。
 name: Deploy r2share
 
 on:
@@ -44,23 +64,63 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # npm run deploy 内部 = npm run check && wrangler deploy
+      # 必填项前置校验（fail fast）。
+      # 为什么需要：ADMIN_PASSWORD 只影响 Worker secret，缺了照样能部署成功，
+      # 但站点会变成「谁也登录不进去」的静默故障；放这里一次性把必填项暴露清楚，
+      # 而不是等用户打开站点才发现。
+      - name: Validate required config
+        run: |
+          set -euo pipefail
+          miss=0
+          need() { # $1=名称 $2=值
+            if [ -z "${2:-}" ]; then
+              echo "  ✗ 必填项缺失：$1"
+              miss=1
+            else
+              echo "  ✓ $1 已配置"
+            fi
+          }
+          need CLOUDFLARE_API_TOKEN "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          need ADMIN_PASSWORD      "${{ secrets.ADMIN_PASSWORD }}"
+          need WORKER_DOMAIN       "${{ vars.WORKER_DOMAIN || secrets.WORKER_DOMAIN }}"
+          need DL_DOMAIN           "${{ vars.DL_DOMAIN || secrets.DL_DOMAIN }}"
+          if [ "$miss" != 0 ]; then
+            echo
+            echo "补齐上面标记的项后重跑：域名等「配置」放 Variables 页，密钥放 Secrets 页。"
+            exit 1
+          fi
+
+      # npm run deploy 内部 = gen-config（注入域名，缺则失败）→ npm run check → wrangler deploy
+      # WORKER_DOMAIN / DL_DOMAIN 是硬性必填：缺失/非法时 gen-config 退出码 1，部署中止。
+      # 每个变量都先读 Variables、再退回 Secrets —— 两类都能配，不强制迁移。
       - name: Deploy Worker
         run: npm run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_DOMAIN: ${{ vars.WORKER_DOMAIN || secrets.WORKER_DOMAIN }}
+          DL_DOMAIN: ${{ vars.DL_DOMAIN || secrets.DL_DOMAIN }}
+          BUCKET_NAME: ${{ vars.BUCKET_NAME || secrets.BUCKET_NAME }}
+          SITE_NAME: ${{ vars.SITE_NAME || secrets.SITE_NAME }}
 
-      # 把 GitHub Secrets 作为权威来源同步到 Cloudflare Worker secrets。
-      # 空值守卫：GitHub 漏填的 secret（值为空的字符串）跳过同步，保留 CF 端现有值，
-      # 防止把已配置的生产密钥误清空（GitHub 未设置的 secret 引用会展开为空字符串）。
+      # 把配置同步为 Cloudflare Worker secrets。
+      # 空值守卫：未配置的项（引用会展开成空字符串）跳过同步，保留 CF 端现有值，
+      # 避免把已配置的生产密钥误清空（ADMIN_PASSWORD 已在上面强制校验过，不会走到这里为空）。
+      # 留空即走自动推导（见 src/index.ts）：
+      #   SESSION_SECRET 空 → 从 ADMIN_PASSWORD 派生会话密钥
+      #   R2_ACCOUNT_ID  空 → 取 CLOUDFLARE_ACCOUNT_ID 的值再同步（S3 端点就是
+      #                      <account_id>.r2.cloudflarestorage.com，两者同值）。
+      #                      注意「复用」发生在这里：Worker 运行时读的是 R2_ACCOUNT_ID，
+      #                      不要把 CLOUDFLARE_ACCOUNT_ID 当成运行时可读的变量。
+      # 注意顺序：首次部署前 Worker 还不存在，`wrangler secret put` 会报 worker not found，
+      # 所以本步骤必须在 Deploy 之后。
       - name: Sync production secrets
         run: |
           set -euo pipefail
           put() { # $1=secret名  $2=值；空值跳过，避免覆盖 CF 端现有配置
             local name="$1" val="${2:-}"
             if [ -z "$val" ]; then
-              echo "  · $name 未在 GitHub Secrets 配置，跳过（保留 CF 端现有值）"
+              echo "  · $name 未配置，跳过（由代码自动推导 / 保留 CF 端现有值）"
               return 0
             fi
             echo "$val" | npx wrangler secret put "$name" --name r2share >/dev/null 2>&1 \
@@ -70,7 +130,32 @@ jobs:
           put SESSION_SECRET        "${{ secrets.SESSION_SECRET }}"
           put R2_ACCESS_KEY_ID      "${{ secrets.R2_ACCESS_KEY_ID }}"
           put R2_SECRET_ACCESS_KEY  "${{ secrets.R2_SECRET_ACCESS_KEY }}"
-          put R2_ACCOUNT_ID         "${{ secrets.R2_ACCOUNT_ID }}"
+          put R2_ACCOUNT_ID         "${R2_ACCOUNT_ID:-$CLOUDFLARE_ACCOUNT_ID}"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+
+      # 桶 CORS：**只在 presigned 直传模式**（UPLOAD_VIA_WORKER != "1"）下才需要。
+      # 默认模式（"1"）浏览器 PUT 打的是本 Worker 的同源 /api/local-put，不触发跨域预检，
+      # 所以这里先读 gen-config 产出的配置判断模式：默认模式直接跳过，
+      # 既不给用户添一个必配步骤，也避免无谓地要求 API Token 带 R2 权限。
+      # 注意：桶必须先存在（README 第 1 步创建 R2 桶），这也是本步骤排在 Deploy 之后的原因之一。
+      - name: Apply bucket CORS (直传模式才需要)
+        run: |
+          set -euo pipefail
+          if grep -qE '^[[:space:]]*UPLOAD_VIA_WORKER[[:space:]]*=[[:space:]]*"1"' wrangler.deploy.toml; then
+            echo "  · UPLOAD_VIA_WORKER=1（上传走 Worker 同源代理），不需要 CORS，跳过"
+            exit 0
+          fi
+          if [ ! -f cors.deploy.json ]; then
+            echo "  ✗ 直传模式必须有 CORS，但 cors.deploy.json 不存在（gen-config 未产出）"
+            exit 1
+          fi
+          echo "  · 直传模式：把 cors.deploy.json 应用到桶 ${BUCKET_NAME:-r2share}"
+          npx wrangler r2 bucket cors set "${BUCKET_NAME:-r2share}" --file cors.deploy.json
+          npx wrangler r2 bucket cors list "${BUCKET_NAME:-r2share}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUCKET_NAME: ${{ vars.BUCKET_NAME || secrets.BUCKET_NAME }}

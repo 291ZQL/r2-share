@@ -1,4 +1,16 @@
 #:schema node_modules/wrangler/config-schema.json
+#
+# ⚠️ 这是「模板」，不是最终部署配置。
+#    域名 / 桶名 / 站名这三类「因人而异」的值一律用 __TOKEN__ 占位，部署前由
+#    scripts/gen-config.mjs 从 GitHub Secrets（本地则读环境变量 / .dev.vars）注入，
+#    生成真正的 wrangler.deploy.toml 后再 wrangler deploy。
+#
+#    原因：wrangler 不支持在 wrangler.toml 里插值环境变量，custom_domain 路由更是
+#    结构化字段，只能由脚本拼出来。因此「域名放进 Secrets、必填、不填就部署失败」
+#    只能靠这层生成来落地。
+#
+#    千万别把本文件里的 __TOKEN__ 换成真实值再提交——仓库是公开的，一旦固化，
+#    别人 fork 后会直接对着你的域名与 R2 桶部署（下载直链会指向你的桶）。
 name = "r2share"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
@@ -18,19 +30,18 @@ binding = "ASSETS"
 # 登录态注入和 window.__CFG__ 会一起失效。显式写死，杜绝这种误伤。
 run_worker_first = ["/", "/api/*"]
 
-# 自定义域：Worker 站点入口
+# 自定义域：Worker 站点入口（由 scripts/gen-config.mjs 按 WORKER_DOMAIN 注入）
 # 用 custom_domain = true（而非 zone_name）：Cloudflare 自动创建 DNS 记录与证书，
 # 所有路径直达 Worker（Worker 即源站），无需手动添加 A/CNAME 记录。
 # 之前用 zone_name 传统 route 时，assets 模式会把它当 assets 路径匹配（部署警告
-# "Will match assets: public\file.114448.xyz"），且手动加的 A 记录导致 522 回源超时。
-[[routes]]
-pattern = "file.114448.xyz"
-custom_domain = true
+# "Will match assets: public\<pattern>"），且手动加的 A 记录导致 522 回源超时。
+# 本地 wrangler dev 用不到路由，故模板里只保留下面这个注入点，避免 dev 解析到占位域名。
+# gen:routes
 
 # R2 公开桶：存文件与 files.json 索引
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "r2share"
+bucket_name = "__BUCKET_NAME__"
 
 # 说明：登录失败计数已改为 Worker 模块内的内存 Map（见 src/index.ts），
 # 不再需要 KV 绑定——KV 免费版「同 key 每秒 1 次写 + 每天 1000 次写」的限制
@@ -38,11 +49,11 @@ bucket_name = "r2share"
 
 [vars]
 # R2 桶名（presigned 签名需要用到）
-BUCKET_NAME = "r2share"
-# 下载直链域名（R2 公开桶绑定的自定义域）
-DL_DOMAIN = "https://dl.114448.xyz"
+BUCKET_NAME = "__BUCKET_NAME__"
+# 下载直链域名（R2 公开桶绑定的自定义域，或 r2.dev 域名）
+DL_DOMAIN = "__DL_DOMAIN__"
 # 站点名称
-SITE_NAME = "我的仓库"
+SITE_NAME = "__SITE_NAME__"
 # 登录态有效期（天）
 SESSION_DAYS = "30"
 # 单文件上传上限（字节），0 表示沿用 Workers 请求体上限。
@@ -54,11 +65,25 @@ MAX_UPLOAD = "99614720"
 # 背景：presigned 直传目标 r2.cloudflarestorage.com 在某些网络被墙（ERR_ADDRESS_UNREACHABLE），
 # 开启后浏览器的上传 PUT 指向本 Worker 的 /api/local-put（同源，无需 CORS），
 # 由 Worker 内部 env.BUCKET.put() 写 R2，绕开被墙端点；下载仍走 DL_DOMAIN 公开桶直链。
+# 保持 '1' 时**不需要任何 R2 S3 凭证**（R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY 都不用配）。
 UPLOAD_VIA_WORKER = "1"
+# 模式开关（一般不用动）：'1' 强制本地代理模式，'0' 强制生产模式。
+# 不设置时按「DL_DOMAIN 是否为合法 URL」自动判断——本地 dev 直接跑本模板时
+# DL_DOMAIN 还是占位符，会自动落到本地模式，无需额外配置。
+# 想在本地区验证真实公开桶直链（而非代理下载），设 LOCAL_MODE = "0" 并配好 DL_DOMAIN。
+# LOCAL_MODE = "0"
 
-# 以下敏感值放在 .dev.vars（本地）或 wrangler secret（生产）：
-#   ADMIN_PASSWORD       管理口令
-#   SESSION_SECRET       HMAC 签名密钥
-#   R2_ACCESS_KEY_ID     R2 S3 API 密钥（用于 presigned 直传签名）
-#   R2_SECRET_ACCESS_KEY
-#   R2_ACCOUNT_ID
+# 以下为必填项（部署时必须配置，缺失会让部署失败）：
+#   ADMIN_PASSWORD       管理口令（Worker secret）
+#   CLOUDFLARE_API_TOKEN 部署认证（GitHub Secret，不进入 Worker）
+#   WORKER_DOMAIN        站点入口域（GitHub Variable，由 gen-config 注入路由）
+#   DL_DOMAIN            下载直链域（GitHub Variable，由 gen-config 注入上面那行）
+#
+# 以下为选填项（有默认值 / 可自动推导，不配也能跑）：
+#   SESSION_SECRET       会话签名密钥。不配则由 ADMIN_PASSWORD 派生（见 src/mode.ts 的
+#                        sessionSecretOf）；单独配置的好处是「改口令不会把自己踢下线」
+#   CLOUDFLARE_ACCOUNT_ID / R2_ACCOUNT_ID
+#                        S3 端点用的账户 id，与 CLOUDFLARE_ACCOUNT_ID 同值，可只配一个
+#   R2_ACCESS_KEY_ID     R2 S3 API 密钥。仅当 UPLOAD_VIA_WORKER="0" 走 presigned 直传时才需要
+#   R2_SECRET_ACCESS_KEY 同上
+#   BUCKET_NAME / SITE_NAME  已在上方 [vars] 给了默认值

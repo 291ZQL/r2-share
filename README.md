@@ -31,7 +31,7 @@ README.md 预览弹层（标题右侧「下载」按钮直链下载）：
 浏览器
  ├─ 打开目录页   ──→ Worker 渲染 HTML（1 次请求；style.css/app.js 由 CF 边缘直接服务，0 次 Worker）
  │                      └─ fetch R2 上的 files.json（1 次 Class B 读）
- ├─ 下载文件     ──→ R2 公开桶直链 dl.114448.xyz（出口永远免费，不经过 Worker）
+ ├─ 下载文件     ──→ R2 公开桶直链 <你的下载域>（出口永远免费，不经过 Worker）
  └─ 上传 N 个文件 ─→ Worker /api/sign（1 次请求，批量签发）
                      → 浏览器并发 PUT 同源 /api/local-put（每文件 1 次请求，Worker 内部写 R2）
                      → Worker /api/commit（1 次请求，批量写索引）
@@ -94,44 +94,88 @@ README.md 预览弹层（标题右侧「下载」按钮直链下载）：
 
 ---
 
-## 一键部署（GitHub Actions）
+## 部署（推荐：GitHub 一键安装）
 
-**推 `main` = 自动部署。** 仓库内置 `.github/workflows/deploy.yml`：push 到 `main`
-就会自动 `wrangler deploy`，并把 GitHub Secrets 当作权威来源同步到 Cloudflare
-Worker secrets。适合想"改完推上去就完事"的场景。
+**Fork → 配好 Secrets → push `main`，完事。** 仓库内置 `.github/workflows/deploy.yml`：
+push 到 `main` 就自动 `wrangler deploy`，并把 GitHub Secrets 当作权威来源同步到
+Cloudflare Worker secrets。
 
-### 所需 GitHub Secrets
+### 域名为什么必须部署时才注入
 
-在仓库 **Settings → Secrets and variables → Actions** 添加（变量名严格一致，共 7 个）。
+域名**因人而异**，绝不能写死在仓库里——否则别人 fork 后会带着作者的域名上线，
+下载直链直接指向作者的 R2 桶。所以本仓库把域名做成**部署时注入的必填项**：
 
-#### 必填（缺了部署必然失败）
+> 叫 Secret 还是 Variable 不影响机制，关键是**它不落仓库**。本仓库推荐放 Variables
+> （明文可见、随时能改），放 Secrets 也照常工作。
 
-| Secret | 用途 | 怎么拿 / 长什么样 |
-| --- | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | 部署认证（wrangler 用它登录 CF） | CF 控制台 → 右上角头像 → **我的个人资料 → API 令牌 → 创建令牌**。需包含 **Workers Scripts Edit** 和 **R2** 权限。形如 `cfut_xxxx`（较长） |
-| `CLOUDFLARE_ACCOUNT_ID` | 账户 id | CF 控制台**右上角**显示的账户 id（32 位十六进制，形如 `a1b2c3...`） |
+```
+wrangler.toml（模板：域名处是 __TOKEN__ 占位，不含任何人的真实域名）
+        ＋  GitHub Variables / Secrets（WORKER_DOMAIN / DL_DOMAIN）
+        ↓   scripts/gen-config.mjs（部署前自动执行，缺项即 exit 1）
+wrangler.deploy.toml（真正部署用的配置；已 gitignore，不落仓库）
+```
 
-#### 必填（与上传模式有关）
+> **为什么不能直接在 `wrangler.toml` 里引用 Secret**：wrangler 不支持在配置里插值
+> 环境变量，`custom_domain` 路由又是结构化字段，只能由脚本生成。于是「域名必填、
+> 不填就部署失败」就落在 `gen-config` 上——**没配 WORKER_DOMAIN / DL_DOMAIN 就生成
+> 不出配置，部署直接中止**。仓库里 `wrangler.toml` 永远只有占位符，从根上 fork-safe。
 
-| Secret | 用途 | 怎么拿 / 长什么样 |
-| --- | --- | --- |
-| `R2_ACCESS_KEY_ID` | R2 S3 API 令牌的 Access Key。即使走 Worker 代理（`UPLOAD_VIA_WORKER=1`）也必须配——`isLocal()` 靠它判断不是本地回退模式 | CF 控制台 → R2 → 右上角 **管理 R2 API 令牌 → 创建**（权限 Object Read & Write）。形如 `45xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
-| `R2_ACCOUNT_ID` | 与 `CLOUDFLARE_ACCOUNT_ID` 相同 | 同一个账户 id，直接填一样的 |
+### 需要配置什么：2 个必填 Variable + 2 个必填 Secret
 
-#### 选填（漏填会跳过同步、保留 CF 端现有值，但建议填全）
+在仓库 **Settings → Secrets and variables → Actions** 里配置。**域名、桶名这类「配置」
+放 Variables 页，真正的密钥放 Secrets 页**——这样必填项只有 4 个，其余全部可留空。
 
-| Secret | 用途 | 怎么拿 / 长什么样 |
-| --- | --- | --- |
-| `ADMIN_PASSWORD` | 网盘管理口令（登录用） | 自己想一个，或与 CF 端现有值保持一致。建议 8 位以上 |
-| `SESSION_SECRET` | **会话签名密钥**：登录后 cookie 用 HMAC-SHA256 加签，防止伪造/篡改登录态。**这个值只存密钥，不对外显示** | `openssl rand -hex 32` 生成，形如 `f7a2c9b1e8d4a6f0...`（64 位十六进制）。**注意**：改动它会让所有已登录用户需要重新登录一次（无副作用），可随时重置 |
-| `R2_SECRET_ACCESS_KEY` | 同一令牌的 Secret Key | 创建令牌时**只显示一次**，立即复制保存；丢了就新建一个令牌 |
+#### Variables 页（非敏感，明文可见，推荐放这里）
 
-> ⚠️ 五个应用密钥（`ADMIN_PASSWORD`/`SESSION_SECRET`/R2_*）的 workflow 行为：
-> GitHub Secrets 是**权威来源**，每次部署用 GitHub 里的值**覆盖** CF 端同名 secret。
-> - 想改密钥：**先在 GitHub 改**，再 push 或手动重跑 workflow，不要只改 CF 控制台（否则会被覆盖回去）
-> - 某个 secret 漏填（值为空）：workflow **跳过同步**，保留 CF 端现有值，不会误清空
+| Variable | 必填 | 用途 | 怎么填 |
+| --- | --- | --- | --- |
+| `WORKER_DOMAIN` | ✅ | **站点入口域** | 形如 `file.example.com`，**不带 `https://`、不带路径**。必须是你 CF 账户下的域名/子域，否则 `custom_domain` 绑定会因 "zone not found" 部署失败 |
+| `DL_DOMAIN` | ✅ | **R2 下载直链域**（公开桶绑定的自定义域） | 形如 `dl.example.com`，或 `<id>.r2.dev`（官方限流，不推荐生产）。同样不带 `https://` |
+| `CLOUDFLARE_ACCOUNT_ID` | 选填 | 账户 id（32 位十六进制） | CF 控制台右上角。只关联一个账户时通常可留空（wrangler 会从 API Token 推断）；若报 `More than one account available` 就把它填上 |
+| `BUCKET_NAME` | 选填 | R2 桶名 | 默认 `r2share`。若改，需同步改桶名与 CORS 应用时的桶名 |
+| `SITE_NAME` | 选填 | 站点名称（页面标题与页头） | 默认 `我的仓库` |
+
+> 域名不是密码，放 Variables 而不是 Secrets 的好处：**随时能看见、能改**，
+> 不用「重新输入一遍才看得到」。两类都支持——同名同时配了会优先读 Variables。
+
+#### Secrets 页（敏感，加密存储）
+
+| Secret | 必填 | 用途 | 怎么拿 |
+| --- | --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | ✅ | 部署认证（wrangler 用它登录 CF） | CF 控制台 → 右上角头像 → **我的个人资料 → API 令牌 → 创建令牌**。需含 **Workers Scripts Edit** 和 **R2** 权限，形如 `cfut_xxxx` |
+| `ADMIN_PASSWORD` | ✅ | 网盘管理口令（登录用） | 自己想一个，建议 8 位以上 |
+| `SESSION_SECRET` | 选填 | 会话签名密钥（cookie 用 HMAC-SHA256 加签） | `openssl rand -hex 32`。**留空则自动从 `ADMIN_PASSWORD` 派生**——便利，但代价见下方「`SESSION_SECRET` 留空的代价」，公网部署建议配上 |
+| `R2_ACCESS_KEY_ID` | 选填 | R2 S3 API 令牌 | **只有关闭 Worker 中转（`UPLOAD_VIA_WORKER=0`）走 presigned 直传时才需要**。默认 `=1` 的上传走 Worker 中转，完全不碰 S3，这三项都不用配 |
+| `R2_SECRET_ACCESS_KEY` | 选填 | 同一令牌的 Secret Key | 创建令牌时**只显示一次**，立即复制保存 |
+| `R2_ACCOUNT_ID` | 选填 | S3 端点用的账户 id | 走 Actions 部署时留空会自动取 `CLOUDFLARE_ACCOUNT_ID` 的值同步到 Worker；**手动部署没有这层同步，需自行填**（两者本来就是同一个账户 id） |
+
+**一句话**：想最快跑起来，只需要填 `WORKER_DOMAIN`、`DL_DOMAIN`、`CLOUDFLARE_API_TOKEN`、
+`ADMIN_PASSWORD` 这 4 个。
+
+> ⚠️ Secrets 页那几项的 workflow 行为：**GitHub 是权威来源**，每次部署用 GitHub 里的值
+> **覆盖** CF 端同名 secret。
+> - 想改密钥：**先在 GitHub 改**，再 push 或手动重跑 workflow，不要只改 CF 控制台（会被覆盖回去）
+> - 某项留空（值为空）：workflow **跳过同步**，保留 CF 端现有值，不会误清空
+> - `ADMIN_PASSWORD` 缺失：**部署会在前置校验里直接失败**，避免「部署成功但谁也登录
+>   不进去」这种静默故障
+> - `SESSION_SECRET` 留空 → Worker 端从 `ADMIN_PASSWORD` 确定性派生会话密钥（少配一个）
+> - `R2_ACCOUNT_ID` 留空 → 取 `CLOUDFLARE_ACCOUNT_ID` 的值同步（见上一节说明）
 >
-> ⚠️ **隐私**：GitHub Secret 的值只会在 Actions 运行时注入，**不要写进 README 或任何仓库文件**——仓库是公开的，写进去等于公开密钥。
+> ⚠️ **隐私**：Secrets 的值只会在 Actions 运行时注入，**不要写进 README 或任何仓库文件**——仓库是公开的，写进去等于公开密钥。（Variables 是明文，别把密钥放那里。）
+
+#### `SESSION_SECRET` 留空的代价
+
+不配 `SESSION_SECRET` 时，会话签名密钥 = `SHA-256("r2share/session-key/v1:" + ADMIN_PASSWORD)`。
+于是**任何拿到一个有效 cookie 的人，都能离线枚举口令**：cookie 的 payload 是明文
+base64 的过期时间，签名是 `HMAC(密钥, payload)`——两边都已知，只剩口令是未知量，
+本地跑字典即可验证猜测，不受登录接口的限流约束。
+
+口令足够强时不构成实际威胁（能拿到 cookie 的人本来也已登录）；但配置一个独立的
+随机串可以**彻底消除这条路径**，顺带让「改口令」不再踢掉自己的会话：
+
+```bash
+openssl rand -hex 32   # 填进 SESSION_SECRET
+```
 
 > 📌 **不再需要 `KV_ID`**。登录失败计数已从 KV 改为 Worker 模块内的内存 Map
 > （原因见「已知限制 · 登录限流」），`wrangler.toml` 里已无任何 KV 绑定，
@@ -144,21 +188,22 @@ Worker secrets。适合想"改完推上去就完事"的场景。
 
 ---
 
-## 部署步骤
+## 手动部署（不用 GitHub Actions）
 
-### 0. 部署前自检（强烈推荐）
+不想用 CI 也行，思路一致：**本地提供域名 → 生成配置 → deploy**。域名取值优先级
+是环境变量 > `.dev.vars`。
+
+### 0. 部署前自检
 
 ```bash
 npx wrangler login   # 浏览器授权（或用 CLOUDFLARE_API_TOKEN 环境变量）
+npm run gen-config   # 先生成 wrangler.deploy.toml（读 WORKER_DOMAIN / DL_DOMAIN）
 npm run check
 ```
 
-这个脚本会扫描 `wrangler.toml` / `.dev.vars` / `cors.json` 的常见
-占位符和弱口令，有问题直接退出码 1 并告诉你怎么修。`npm run deploy` 内部会自动跑这一步。
-
-检查项包括：首页是否显式走 Worker（`run_worker_first` 含 `"/"`）、`MAX_UPLOAD`
-是否顶到 CF 账户请求体上限、`cors.json` 的 origin 是否还是占位符，
-以及 `wrangler.toml` 里是否还残留已废弃的 `[[kv_namespaces]]`。
+`check` 校验的是生成后的 `wrangler.deploy.toml`（+ `cors.deploy.json`）：占位符是否
+都替换了、是否绑了自定义域、`MAX_UPLOAD` 是否顶到账户请求体上限、是否残留已废弃的
+`[[kv_namespaces]]`。有问题直接退出码 1。`npm run deploy` 内部会自动跑这两步。
 
 ### 1. 创建 R2 桶
 
@@ -171,7 +216,7 @@ npx wrangler r2 bucket create r2share
 在 Cloudflare 控制台 → R2 → 你的桶 → Settings：
 
 - **Public access** 选 `Allow`，会得到一个 `r2.dev` 域名
-- 在 **Custom Domains** 里绑定 `dl.114448.xyz`
+- 在 **Custom Domains** 里绑定你的下载域（即 `DL_DOMAIN`，如 `dl.<你的域名>`）
 
 > ⚠️ 必须用自定义域。`r2.dev` 官方明确限流、不推荐生产使用。
 
@@ -179,77 +224,93 @@ npx wrangler r2 bucket create r2share
 
 | 内容 | 放哪 | 是否进仓库 |
 | --- | --- | --- |
-| 管理口令、会话密钥、R2 API 密钥 | `wrangler secret`（生产）/ `.dev.vars`（本地） | ❌ |
-| 桶名、下载域名、站点名、路由域名 | `wrangler.toml` 的 `[vars]` / `[[routes]]` | ✅ 这些本就是公开信息 |
+| 管理口令、会话密钥 | `wrangler secret`（生产）/ `.dev.vars`（本地） | ❌ |
+| R2 S3 API 密钥（**仅**关闭 Worker 中转走直传时才需要） | 同上 | ❌ |
+| Worker 域名、下载域名、桶名、站点名 | GitHub **Variables**（或 Secrets）→ `gen-config` 注入 → 生成的 `wrangler.deploy.toml` | ❌（生成物已 gitignore） |
+| 模板 `wrangler.toml` / `cors.json` 的结构 | 仓库 | ✅（只有 `__TOKEN__` 占位符，不含任何人的真实域名） |
 
 ### 3. 设置密钥
 
+必须的只有管理口令：
+
 ```bash
 npx wrangler secret put ADMIN_PASSWORD      # 管理口令
-npx wrangler secret put SESSION_SECRET      # openssl rand -hex 32 生成
-npx wrangler secret put R2_ACCESS_KEY_ID    # R2 → S3 API 令牌
+```
+
+以下都可留空，按需再配：
+
+```bash
+npx wrangler secret put SESSION_SECRET      # 选填：留空则由 ADMIN_PASSWORD 派生会话密钥（代价见上文）
+npx wrangler secret put R2_ACCESS_KEY_ID    # 选填：仅当 UPLOAD_VIA_WORKER=0 走 presigned 直传时才需要
 npx wrangler secret put R2_SECRET_ACCESS_KEY
-npx wrangler secret put R2_ACCOUNT_ID
+npx wrangler secret put R2_ACCOUNT_ID       # 走直传时必填，值同 CLOUDFLARE_ACCOUNT_ID
 ```
 
-R2 的 S3 API 令牌在控制台 R2 概览页右侧「Manage R2 API Tokens」创建，权限选 Object Read & Write。
+> **为什么 R2 S3 凭证是选填的**：默认 `UPLOAD_VIA_WORKER = "1"`，上传由 Worker 内部
+> `env.BUCKET.put()` 直接写入，不经过 S3 API，因此完全不需要 API 令牌。
+> R2 的 S3 API 令牌在控制台 R2 概览页右侧「Manage R2 API Tokens」创建，权限选
+> Object Read & Write——**只有**你要关掉 Worker 中转、改走浏览器直传时才需要它。
 
-### 4. 修改配置
+### 4. 提供域名并生成配置
 
-编辑 `wrangler.toml`：
+**不要**直接编辑 `wrangler.toml`（它是模板，改它等于把域名写进公开仓库）。把域名
+交给 `gen-config`，二选一：
 
-```toml
-[vars]
-BUCKET_NAME = "r2share"
-DL_DOMAIN   = "https://dl.114448.xyz"   # 第 2 步绑定的域名
-SITE_NAME   = "我的仓库"
+写进 `.dev.vars`（推荐；`.dev.vars` 已 gitignore，参考 `.dev.vars.example`）：
+
 ```
+WORKER_DOMAIN=file.<你的域名>
+DL_DOMAIN=dl.<你的域名>
+# 选填
+# BUCKET_NAME=r2share
+# SITE_NAME=我的仓库
+```
+
+或临时用环境变量：
+
+```bash
+WORKER_DOMAIN=file.<你的域名> DL_DOMAIN=dl.<你的域名> npm run gen-config
+```
+
+生成 `wrangler.deploy.toml`（+ `cors.deploy.json`）。
 
 ### 5. 首次部署
 
 ```bash
-npm run deploy
+npm run deploy   # = gen-config → check → wrangler deploy --config wrangler.deploy.toml
 ```
 
-> 第一次 deploy 后 Cloudflare 会分配一个 Worker URL，形如
-> `r2share.<account-subdomain>.workers.dev`，**记下这个 URL**——下一步 CORS 需要。
+### 6. 配置 CORS（仅 presigned 直传需要，CI 会自动做）
 
-### 6. 配置 CORS（首次 deploy 之后才能填对）
-
-浏览器直传是跨域 PUT，必须在桶上放行。**第一次 deploy 之后**，把 Worker URL
-填进 `cors.json` 的 `allowed.origins`（替换 `<your-worker-domain>`），然后：
+默认上传走 Worker 代理（同源 PUT `/api/local-put`），**用不到 CORS**。只有把
+`UPLOAD_VIA_WORKER` 改成 `0` 改用 presigned 直传时，浏览器才会跨域 PUT，需要在桶上放行：
 
 ```bash
-npx wrangler r2 bucket cors set r2share --file cors.json
+npx wrangler r2 bucket cors set r2share --file cors.deploy.json
 ```
 
-> ⚠️ `cors.json` 必须用**新版嵌套格式**：`{"rules":[{"allowed":{"origins":[],"methods":[],"headers":[]}}]}`。
+`cors.deploy.json` 由 `gen-config` 生成，origin 已按 `WORKER_DOMAIN` 填好。
+
+> **GitHub Actions 一键部署不用手动跑这步**：流水线最后一步 `Apply bucket CORS` 会读
+> 生成的 `wrangler.deploy.toml` 判断上传模式——默认的代理模式直接跳过，
+> 只有直传模式（`UPLOAD_VIA_WORKER` ≠ `1`）才自动应用。手动 `wrangler` 部署才需要自己执行。
+
+> ⚠️ 无论模板还是生成物都必须用**新版嵌套格式**：`{"rules":[{"allowed":{"origins":[],"methods":[],"headers":[]}}]}`。
 > 允许的请求头字段是 `allowed` 对象内的 **`headers`**（不是外层 `allowedHeaders`——
 > 字段名/层级错误会被 R2 API 静默忽略，导致浏览器跨域预检失败、上传卡死）。
 > 其余字段驼峰命名（`exposeHeaders` / `maxAgeSeconds`）。
 > 旧版裸数组 / PascalCase 格式（`AllowedOrigins`）会让 R2 API 报 `code 10040 "JSON not well formed"`。
-> 参考 `cors.json` 仓库内已有内容。
 
-> 为什么不在 deploy 前填？因为 Worker URL 在 deploy 后才存在。
-> 部署前 `npm run check` 会主动提示这一项未就绪。
+### 7. Worker 自定义域由 WORKER_DOMAIN 自动绑定
 
-### 7. 绑定 Worker 自定义域（推荐，无需手动配 DNS）
+`gen-config` 会按 `WORKER_DOMAIN` 生成 `[[routes]] pattern = "<你的域名>" custom_domain = true`，
+Cloudflare 自动创建 DNS 记录与证书，所有路径直达 Worker，无需在 DNS 控制台做任何操作。
 
-如果想用自定义域名（如 `file.114448.xyz`），在 `wrangler.toml` 里用
-`custom_domain = true`（而不是 `zone_name`）——Cloudflare 会自动创建 DNS 记录与证书：
-
-```toml
-[[routes]]
-pattern = "file.114448.xyz"
-custom_domain = true
-```
-
-> ⚠️ 不要用 `zone_name` 传统路由 + 手动 A 记录的方式：在 assets 模式下，
-> 传统路由会被当作 assets 路径匹配（部署时警告 "Will match assets: public\<pattern>"），
-> 且手动添加的 A 记录会因回源超时导致 **522 Connection timed out**。
-> `custom_domain = true` 部署后，所有路径直达 Worker，无需在 DNS 控制台做任何操作。
-
-加完后回到第 6 步，把 `cors.json` 的 `<your-worker-domain>` 改成这个新域名再应用。
+> ⚠️ 模板刻意不用 `zone_name` 传统路由 + 手动 A 记录：在 assets 模式下传统路由会被
+> 当作 assets 路径匹配（部署警告 "Will match assets: public\<pattern>"），且手动加的
+> A 记录会因回源超时导致 **522 Connection timed out**。
+> 前提：`WORKER_DOMAIN` 指向的域名必须已接入你的 Cloudflare 账户，否则绑定会报
+> "zone not found" 而部署失败。
 
 ---
 
@@ -257,19 +318,26 @@ custom_domain = true
 
 ```bash
 npm install
-cp .dev.vars.example .dev.vars             # 按需改口令
-npm run dev                      # http://127.0.0.1:8787
+cp .dev.vars.example .dev.vars   # 按需改口令；要跑 deploy/gen-config 还要填 WORKER_DOMAIN、DL_DOMAIN
+npm run dev                      # http://127.0.0.1:8787（用模板 wrangler.toml）
 node scripts/seed.mjs            # 灌入演示数据
 TEST_PASSWORD='<.dev.vars 里的 ADMIN_PASSWORD>' node scripts/smoke.mjs   # 全流程冒烟（49 项）
-npm test                         # 单元测试（203 项，见下）
-npm run check                    # 部署前自检
+npm test                         # 单元测试（228 项，见下）
+npm run gen-config               # 部署前：生成 wrangler.deploy.toml（域名取自环境变量 / .dev.vars）
+npm run check                    # 部署前自检（校验生成物）
 ```
 
-`npm test` 会依次跑四套**纯离线**测试（不需要起服务、不连网络）：
+> `npm run dev` 直接用模板 `wrangler.toml`（无路由、`DL_DOMAIN` 还是占位符）：程序据此
+> 判定为**代理模式**，上传下载都走 Worker 代理，不需要任何 R2 凭证即可调试。
+> 想在本地区验证真实公开桶直链，先 `npm run gen-config`，再
+> `wrangler dev --config wrangler.deploy.toml`。
+
+`npm test` 会依次跑五套**纯离线**测试（不需要起服务、不连网络）：
 
 | 脚本 | 覆盖 | 项数 |
 | --- | --- | --- |
 | `scripts/test-crypto.mjs` | SigV4 签名向量、会话 cookie 加签/验签 | 14 |
+| `scripts/test-mode.mjs` | 运行模式判定（代理/直连、上传通道）、会话密钥派生与守卫 | 25 |
 | `scripts/test-store.mjs` | 路径与 MIME 校验、索引 CAS（含冲突重试、批量幂等、递归删目录）、冲突异常类型与 409 映射契约 | 100 |
 | `scripts/test-preview.mjs` | 前端纯函数：预览分类、Markdown 渲染 | 54 |
 | `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约 + 部署配置断言 | 35 |
@@ -301,8 +369,14 @@ npm run push:gh -- src/index.ts public/app.js   # 只同步指定文件
 >
 > 脚本只同步 **git 已跟踪**的文件，因此 `.dev.vars` 天然不会上传。
 
-本地没有 R2 的 S3 凭证时，程序会自动进入**回退模式**：上传下载改走 Worker 代理
-（`/api/local-put`、`/api/local-get`、`/api/local-index`）。一旦配上凭证，这些路由自动拒绝服务。
+程序按「公开桶下载域 `DL_DOMAIN` 是否配好」自动区分运行模式：未配（或还是模板占位符）
+时进入**代理模式**，上传下载改走 Worker 代理（`/api/local-put`、`/api/local-get`、
+`/api/local-index`）；配好之后这些路由自动拒绝服务，下载改走公开桶直链、不消耗 Worker
+请求。也可以用 `LOCAL_MODE=0/1` 强制指定模式。
+
+> 判据刻意**不看 R2 S3 凭证是否存在**——否则为省事不填凭证的用户，会让生产站点整体退化成
+> 代理模式，每次下载白烧一个 Worker 请求。判据与离线测试都在 `src/mode.ts` 与
+> `scripts/test-mode.mjs`。
 
 ---
 
@@ -335,8 +409,8 @@ npm run push:gh -- src/index.ts public/app.js   # 只同步指定文件
 | POST | `/api/mkdir` | 是 | 新建目录（写 `<path>/` 占位对象，幂等） |
 | DELETE | `/api/dir` | 是 | 递归删除目录（前缀批量删 + 一次索引写） |
 | POST | `/api/refresh` | 是 | 全量重建索引（对账用，别在常规流程里频繁调） |
-| GET | `/api/local-index` / `/api/local-get` | 否（仅本地回退模式可用） | 读索引 / 读对象；配了 R2 凭证或未开上传代理后自动返回 400 |
-| PUT | `/api/local-put?key=…` | 是 | 本地回退模式的上传写入；按 `content-length` 兜一道 `MAX_UPLOAD` |
+| GET | `/api/local-index` / `/api/local-get` | 否（仅代理模式可用） | 读索引 / 读对象；配好 `DL_DOMAIN`（生产模式）后自动返回 400 |
+| PUT | `/api/local-put?key=…` | 是 | 代理模式与 `UPLOAD_VIA_WORKER=1` 时的上传写入；按 `content-length` 兜一道 `MAX_UPLOAD` |
 
 ### 在线预览
 

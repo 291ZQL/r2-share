@@ -1,11 +1,33 @@
 # 复制为 .dev.vars 后按需修改
 # 注意：.dev.vars 已在 .gitignore 中，不会被提交
+#
+# 说明：本文件同时是 scripts/gen-config.mjs 的本地取值来源（优先级低于 process.env）。
+#
+# 真正必须配的只有一项：管理口令。
+# SESSION_SECRET 不填也能跑——Worker 会从 ADMIN_PASSWORD 确定性派生会话密钥
+# （代价：改口令会让所有已登录会话失效；想避免就单独配一个随机串）。
 
 ADMIN_PASSWORD=change-me
-SESSION_SECRET=random-long-string-please-change
+# SESSION_SECRET=          # 选填，建议 openssl rand -hex 32 生成
 
-# 以下三项留空 → 本地回退模式（上传下载走 Worker 代理，可离线开发）
-# 填写后 → 自动切换为 presigned 直传 + R2 公开桶直链（需要真实 R2 资源）
+# ---- 部署配置（本地跑 gen-config / deploy 时必填；只在 wrangler dev 里调试可留空）----
+# DL_DOMAIN 还兼作「是否本地模式」的开关：它不是合法的 https:// 地址时，
+# Worker 自动按本地模式运行（下载/索引走 Worker 代理，可离线开发）。
+# 想在本地区验证真实公开桶直链，就填上它，并按需设 LOCAL_MODE=0。
+# Worker 站点入口域（不带 http:// 前缀），对应 worker 的 [[routes]] custom_domain
+# WORKER_DOMAIN=file.example.com
+# R2 下载直链域（自定义域或 <id>.r2.dev），用于拼下载链接
+# DL_DOMAIN=dl.example.com
+# R2 桶名（选填，默认 r2share）
+# BUCKET_NAME=r2share
+# 站点名称（选填，默认 我的仓库）
+# SITE_NAME=我的仓库
+
+# ---- R2 S3 凭证：选填 ----
+# 默认上传走 Worker 中转（UPLOAD_VIA_WORKER=1），完全不碰 S3，下面三项都不用配。
+# 只有改成 presigned 直传（UPLOAD_VIA_WORKER=0）时才需要，且要保证
+# r2.cloudflarestorage.com 在你的网络可达。R2_ACCOUNT_ID 留空会自动复用
+# CLOUDFLARE_ACCOUNT_ID（S3 端点就是 <account_id>.r2.cloudflarestorage.com）。
 # R2_ACCESS_KEY_ID=
 # R2_SECRET_ACCESS_KEY=
 # R2_ACCOUNT_ID=

@@ -1,6 +1,10 @@
 node_modules/
 .wrangler/
 .dev.vars
+# 由 scripts/gen-config.mjs 从 Secrets/环境变量生成的真正部署配置（含你的真实域名），
+# 不进仓库——这是「域名放进 Secrets、模板不含任何人的域名」的关键一环
+wrangler.deploy.toml
+cors.deploy.json
 # 本地私有部署配置（历史遗留：KV 绑定已移除，此文件不再被任何脚本读取，
 # 保留忽略规则只是防止旧文件被误提交，可自行删除）
 .deploy.local.json
