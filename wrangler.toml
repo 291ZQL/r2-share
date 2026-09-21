@@ -1,15 +1,19 @@
 #:schema node_modules/wrangler/config-schema.json
 #
 # ⚠️ 这是「模板」，不是最终部署配置。
-#    域名 / 桶名 / 站名这三类「因人而异」的值一律用 __TOKEN__ 占位，部署前由
-#    scripts/gen-config.mjs 从 GitHub Secrets（本地则读环境变量 / .dev.vars）注入，
-#    生成真正的 wrangler.deploy.toml 后再 wrangler deploy。
+#    部署前由 scripts/gen-config.mjs 从 GitHub Variables/Secrets（本地则读环境变量 /
+#    .dev.vars）注入真实值，生成真正的 wrangler.deploy.toml 后再 wrangler deploy。
 #
 #    原因：wrangler 不支持在 wrangler.toml 里插值环境变量，custom_domain 路由更是
 #    结构化字段，只能由脚本拼出来。因此「域名放进 Secrets、必填、不填就部署失败」
 #    只能靠这层生成来落地。
 #
-#    千万别把本文件里的 __TOKEN__ 换成真实值再提交——仓库是公开的，一旦固化，
+#    ⚠️ 本文件的值一律写「合法默认值」，不用 __TOKEN__ 占位——这不是疏忽：
+#    wrangler 会校验字段格式（桶名必须 3-63 位小写字母/数字/连字符），
+#    非法占位符会让 `wrangler dev` 在**配置解析阶段**直接退出，程序根本没机会运行。
+#    gen-config 按「键名逐行覆盖」注入真值，所以这里写什么默认值都能被正确替换。
+#
+#    千万别把本文件里的默认值改成你的真实域名再提交——仓库是公开的，一旦固化，
 #    别人 fork 后会直接对着你的域名与 R2 桶部署（下载直链会指向你的桶）。
 name = "r2share"
 main = "src/index.ts"
@@ -41,19 +45,21 @@ run_worker_first = ["/", "/api/*"]
 # R2 公开桶：存文件与 files.json 索引
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "__BUCKET_NAME__"
+bucket_name = "r2share"
 
 # 说明：登录失败计数已改为 Worker 模块内的内存 Map（见 src/index.ts），
 # 不再需要 KV 绑定——KV 免费版「同 key 每秒 1 次写 + 每天 1000 次写」的限制
 # 会让爆破场景下的计数失真，也平白多出一次往返。
 
 [vars]
-# R2 桶名（presigned 签名需要用到）
-BUCKET_NAME = "__BUCKET_NAME__"
-# 下载直链域名（R2 公开桶绑定的自定义域，或 r2.dev 域名）
-DL_DOMAIN = "__DL_DOMAIN__"
+# R2 桶名（presigned 签名需要用到）。必须与上面 [[r2_buckets]] bucket_name 一致，
+# 否则 presigned 上传会签到另一个桶（check-deploy 有一致性检查钉住这条）。
+BUCKET_NAME = "r2share"
+# 下载直链域名（R2 公开桶绑定的自定义域，或 r2.dev 域名）。留空 = 本地/代理模式：
+# 下载与索引改走本 Worker（/api/local-get、/api/local-index），无需配置即可本地开发。
+DL_DOMAIN = ""
 # 站点名称
-SITE_NAME = "__SITE_NAME__"
+SITE_NAME = "我的仓库"
 # 登录态有效期（天）
 SESSION_DAYS = "30"
 # 单文件上传上限（字节），0 表示沿用 Workers 请求体上限。
@@ -68,8 +74,8 @@ MAX_UPLOAD = "99614720"
 # 保持 '1' 时**不需要任何 R2 S3 凭证**（R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY 都不用配）。
 UPLOAD_VIA_WORKER = "1"
 # 模式开关（一般不用动）：'1' 强制本地代理模式，'0' 强制生产模式。
-# 不设置时按「DL_DOMAIN 是否为合法 URL」自动判断——本地 dev 直接跑本模板时
-# DL_DOMAIN 还是占位符，会自动落到本地模式，无需额外配置。
+# 不设置时按「DL_DOMAIN 是否为合法 URL」自动判断——模板里 DL_DOMAIN 是空串，
+# 因此 `wrangler dev` 直接跑本模板就会落到本地模式，无需额外配置。
 # 想在本地区验证真实公开桶直链（而非代理下载），设 LOCAL_MODE = "0" 并配好 DL_DOMAIN。
 # LOCAL_MODE = "0"
 
@@ -86,4 +92,5 @@ UPLOAD_VIA_WORKER = "1"
 #                        S3 端点用的账户 id，与 CLOUDFLARE_ACCOUNT_ID 同值，可只配一个
 #   R2_ACCESS_KEY_ID     R2 S3 API 密钥。仅当 UPLOAD_VIA_WORKER="0" 走 presigned 直传时才需要
 #   R2_SECRET_ACCESS_KEY 同上
-#   BUCKET_NAME / SITE_NAME  已在上方 [vars] 给了默认值
+#   BUCKET_NAME / SITE_NAME  已在上方 [vars] 给了默认值（r2share / 我的仓库），
+#                        gen-config 会在部署时按你的实际配置覆盖

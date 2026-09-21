@@ -109,7 +109,7 @@ Cloudflare Worker secrets。
 > （明文可见、随时能改），放 Secrets 也照常工作。
 
 ```
-wrangler.toml（模板：域名处是 __TOKEN__ 占位，不含任何人的真实域名）
+wrangler.toml（模板：域名/桶名处是合法默认值，不含任何人的真实域名）
         ＋  GitHub Variables / Secrets（WORKER_DOMAIN / DL_DOMAIN）
         ↓   scripts/gen-config.mjs（部署前自动执行，缺项即 exit 1）
 wrangler.deploy.toml（真正部署用的配置；已 gitignore，不落仓库）
@@ -118,7 +118,7 @@ wrangler.deploy.toml（真正部署用的配置；已 gitignore，不落仓库�
 > **为什么不能直接在 `wrangler.toml` 里引用 Secret**：wrangler 不支持在配置里插值
 > 环境变量，`custom_domain` 路由又是结构化字段，只能由脚本生成。于是「域名必填、
 > 不填就部署失败」就落在 `gen-config` 上——**没配 WORKER_DOMAIN / DL_DOMAIN 就生成
-> 不出配置，部署直接中止**。仓库里 `wrangler.toml` 永远只有占位符，从根上 fork-safe。
+> 不出配置，部署直接中止**。仓库里 `wrangler.toml` 只放默认值，从根上 fork-safe。
 
 ### 需要配置什么：2 个必填 Variable + 2 个必填 Secret
 
@@ -201,9 +201,12 @@ npm run gen-config   # 先生成 wrangler.deploy.toml（读 WORKER_DOMAIN / DL_D
 npm run check
 ```
 
-`check` 校验的是生成后的 `wrangler.deploy.toml`（+ `cors.deploy.json`）：占位符是否
-都替换了、是否绑了自定义域、`MAX_UPLOAD` 是否顶到账户请求体上限、是否残留已废弃的
-`[[kv_namespaces]]`。有问题直接退出码 1。`npm run deploy` 内部会自动跑这两步。
+`check` 校验的是生成后的 `wrangler.deploy.toml`（+ `cors.deploy.json`）：**是否已生成
+部署配置**（没生成直接阻断——模板只有默认值，拿它去部署等于对默认桶名与空域名上线）、
+**两处桶名是否一致**（`[[r2_buckets]] bucket_name` 决定绑定的桶，`[vars] BUCKET_NAME`
+是 presigned 签名用的桶名，不一致会把文件签到另一个桶）、是否绑了自定义域、`MAX_UPLOAD`
+是否顶到账户请求体上限、是否残留已废弃的 `[[kv_namespaces]]`。有问题直接退出码 1。
+`npm run deploy` 内部会自动跑这两步。
 
 ### 1. 创建 R2 桶
 
@@ -227,7 +230,7 @@ npx wrangler r2 bucket create r2share
 | 管理口令、会话密钥 | `wrangler secret`（生产）/ `.dev.vars`（本地） | ❌ |
 | R2 S3 API 密钥（**仅**关闭 Worker 中转走直传时才需要） | 同上 | ❌ |
 | Worker 域名、下载域名、桶名、站点名 | GitHub **Variables**（或 Secrets）→ `gen-config` 注入 → 生成的 `wrangler.deploy.toml` | ❌（生成物已 gitignore） |
-| 模板 `wrangler.toml` / `cors.json` 的结构 | 仓库 | ✅（只有 `__TOKEN__` 占位符，不含任何人的真实域名） |
+| 模板 `wrangler.toml` / `cors.json` 的结构 | 仓库 | ✅（只有合法默认值，不含任何人的真实域名） |
 
 ### 3. 设置密钥
 
@@ -253,8 +256,8 @@ npx wrangler secret put R2_ACCOUNT_ID       # 走直传时必填，值同 CLOUDF
 
 ### 4. 提供域名并生成配置
 
-**不要**直接编辑 `wrangler.toml`（它是模板，改它等于把域名写进公开仓库）。把域名
-交给 `gen-config`，二选一：
+**不要**直接编辑 `wrangler.toml`（它是模板：改它等于把域名写进公开仓库，而且部署读的是
+`gen-config` 生成的配置，直接改模板不会生效）。把域名交给 `gen-config`，二选一：
 
 写进 `.dev.vars`（推荐；`.dev.vars` 已 gitignore，参考 `.dev.vars.example`）：
 
@@ -327,7 +330,7 @@ npm run gen-config               # 部署前：生成 wrangler.deploy.toml（域
 npm run check                    # 部署前自检（校验生成物）
 ```
 
-> `npm run dev` 直接用模板 `wrangler.toml`（无路由、`DL_DOMAIN` 还是占位符）：程序据此
+> `npm run dev` 直接用模板 `wrangler.toml`（无路由、`DL_DOMAIN` 为空串）：程序据此
 > 判定为**代理模式**，上传下载都走 Worker 代理，不需要任何 R2 凭证即可调试。
 > 想在本地区验证真实公开桶直链，先 `npm run gen-config`，再
 > `wrangler dev --config wrangler.deploy.toml`。
@@ -362,14 +365,15 @@ npm run push:gh               # 同步全部已跟踪文件
 npm run push:gh -- src/index.ts public/app.js   # 只同步指定文件
 ```
 
-> 为什么不是 `git push`：本仓库的开发环境代理只放行 `api.github.com`、拦截 `github.com`，
-> git 协议必然超时。脚本改走 **GitHub Git Data API**：把所有文件塞进同一个 tree/commit
-> 一次性推送，效果等价，且**一次同步只产生一个 commit、只触发一次 CI**。
-> 在正常网络下直接 `git push` 即可，无需用这个脚本。
+> ⚠️ **首选直接 `git push`**（git 协议已实测可用）。这个脚本改走 **GitHub Git Data API**，
+> 把所有文件塞进同一个 tree/commit 一次性推送，好处是**一次同步只产生一个 commit、
+> 只触发一次 CI**；代价是它造出的提交与本地历史**没有共同祖先**——远端会出现一个与本地
+> 分叉的合成提交，之后 `git push` 无法快进（需要变基或手工接续），而且它用 `base_tree`
+> **只能增改、删不掉文件**。只在 git 协议确实不通时才用它。
 >
 > 脚本只同步 **git 已跟踪**的文件，因此 `.dev.vars` 天然不会上传。
 
-程序按「公开桶下载域 `DL_DOMAIN` 是否配好」自动区分运行模式：未配（或还是模板占位符）
+程序按「公开桶下载域 `DL_DOMAIN` 是否配好」自动区分运行模式：未配（模板里是空串）
 时进入**代理模式**，上传下载改走 Worker 代理（`/api/local-put`、`/api/local-get`、
 `/api/local-index`）；配好之后这些路由自动拒绝服务，下载改走公开桶直链、不消耗 Worker
 请求。也可以用 `LOCAL_MODE=0/1` 强制指定模式。

@@ -144,16 +144,33 @@ if (!/^#\s*gen:routes\s*$/m.test(tmpl)) {
 const routesBlock = `[[routes]]\npattern = "${workerDomain}"\ncustom_domain = true`;
 let toml = tmpl.replace(/^#\s*gen:routes\s*$/m, routesBlock);
 
-for (const [token, value] of [
-  ['__BUCKET_NAME__', bucketName],
-  ['__DL_DOMAIN__', `https://${dlHost}`],
-  ['__SITE_NAME__', siteName],
-]) {
-  if (!toml.includes(token)) err(`${TMPL_TOML} 缺少占位符 ${token}`);
-  toml = toml.split(token).join(value);
+/**
+ * 按 TOML 键名覆盖引号字符串值（只动那一行，注释与其它行原样保留）。
+ *
+ * 为什么不用「__TOKEN__ 字符串替换」：模板里的值必须保持**合法**——wrangler 会校验
+ * 字段格式（桶名必须 3-63 位小写字母/数字/连字符），非法占位符会让 `wrangler dev`
+ * 在**配置解析阶段**直接退出，程序根本没机会运行本地模式。
+ * 按键名覆盖对「合法默认值」与「旧式 token」两种模板都成立，也更抗模板微调。
+ */
+function setKey(src, key, value) {
+  // 锚定行首：bucket_name 与 BUCKET_NAME 是 TOML 里两个不同的键，不能互相误伤
+  const re = new RegExp(`^(\\s*${key}\\s*=\\s*)"(?:[^"\\\\]|\\\\.)*"`, 'm');
+  if (!re.test(src)) return null;
+  return src.replace(re, (_m, indent) => `${indent}"${value}"`);
 }
 
-// 兜底：已知占位符必须全部被替换（只查真实 token，避免误伤注释里提到的 __TOKEN__）
+for (const [key, value, label] of [
+  ['bucket_name', bucketName, 'R2 桶名（[[r2_buckets]]）'],
+  ['BUCKET_NAME', bucketName, 'R2 桶名（[vars]，须与上者一致）'],
+  ['DL_DOMAIN', `https://${dlHost}`, '下载直链域'],
+  ['SITE_NAME', siteName, '站点名'],
+]) {
+  const next = setKey(toml, key, value);
+  if (next === null) err(`${TMPL_TOML} 找不到可覆盖的键 ${key}（${label}）`);
+  else toml = next;
+}
+
+// 兜底：生成物里不该再有 __TOKEN__（防模板被改回占位符、而本脚本没同步跟上）
 const leftover = toml.match(/__(?:BUCKET_NAME|DL_DOMAIN|SITE_NAME|WORKER_DOMAIN)__/g);
 if (leftover) err(`生成的配置仍残留占位符：${[...new Set(leftover)].join(', ')}`);
 

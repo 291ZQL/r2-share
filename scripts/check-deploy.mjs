@@ -34,39 +34,66 @@ section('2. 部署配置');
 const hasDeployCfg = existsSync('wrangler.deploy.toml');
 const cfgPath = hasDeployCfg ? 'wrangler.deploy.toml' : 'wrangler.toml';
 const toml = await readFile(cfgPath, 'utf8');
-if (hasDeployCfg) ok(`读取生成后的配置 ${cfgPath}`);
-else warn('未找到 wrangler.deploy.toml（尚未生成）——本次校验的是模板，域名等项会被判为未就绪');
-
-// 模板占位符未替换 = 域名没配。这是 fork 后最危险的「静默跑偏」：
-// 不拦下来的话，站点会带着作者的域名上线（下载直链指向作者的 R2 桶）。
-// 只查真实 token，避免误伤模板头部注释里提到的 __TOKEN__。
-const leftover = toml.match(/__(?:BUCKET_NAME|DL_DOMAIN|SITE_NAME|WORKER_DOMAIN)__/g);
-if (leftover) {
+if (hasDeployCfg) {
+  ok(`读取生成后的配置 ${cfgPath}`);
+} else {
+  // 模板只给合法默认值（保证 wrangler dev 能直接跑），真实域名/桶名全靠 gen-config 注入。
+  // 所以「没生成 deploy 配置」必须阻断：否则会拿默认桶名与空域名去部署。
   err(
-    `${cfgPath} 仍有未替换的占位符：${[...new Set(leftover)].join(', ')}\n` +
-      '     先运行 `npm run gen-config`（配置 WORKER_DOMAIN / DL_DOMAIN 后）再部署'
+    '未找到 wrangler.deploy.toml（部署配置尚未生成）——本次只能校验模板，域名/路由无法确认\n' +
+      '     先运行 `npm run gen-config`（需配置 WORKER_DOMAIN / DL_DOMAIN）再部署'
   );
 }
 
-// 自定义域路由：必须存在，且是 custom_domain（zone_name 传统路由在 assets 模式下易 522）
-const routeMatch = toml.match(/\[\[routes\]\][\s\S]*?pattern\s*=\s*"([^"]+)"/);
-if (!routeMatch) {
-  err('缺少 [[routes]] pattern：Worker 未绑定自定义域（只会有 workers.dev 子域）');
-} else if (!/custom_domain\s*=\s*true/.test(toml)) {
-  warn('[[routes]] 未使用 custom_domain = true：zone_name 传统路由在 assets 模式下易触发 522 回源超时');
-} else {
-  ok(`Worker 自定义域 = ${routeMatch[1]}`);
+// 兜底：生成物里若仍残留 __TOKEN__，说明模板被改回占位符、而 gen-config 没同步跟上
+if (hasDeployCfg) {
+  const leftover = toml.match(/__(?:BUCKET_NAME|DL_DOMAIN|SITE_NAME|WORKER_DOMAIN)__/g);
+  if (leftover) err(`${cfgPath} 仍有未替换的占位符：${[...new Set(leftover)].join(', ')}`);
 }
 
-const bucketMatch = toml.match(/bucket_name\s*=\s*"([^"]+)"/);
+// 自定义域路由：必须存在，且是 custom_domain（zone_name 传统路由在 assets 模式下易 522）。
+// 模板里没有路由（由 gen-config 注入），所以只在生成物上判定。
+if (hasDeployCfg) {
+  const routeMatch = toml.match(/\[\[routes\]\][\s\S]*?pattern\s*=\s*"([^"]+)"/);
+  if (!routeMatch) {
+    err('缺少 [[routes]] pattern：Worker 未绑定自定义域（只会有 workers.dev 子域）');
+  } else if (!/custom_domain\s*=\s*true/.test(toml)) {
+    warn('[[routes]] 未使用 custom_domain = true：zone_name 传统路由在 assets 模式下易触发 522 回源超时');
+  } else {
+    ok(`Worker 自定义域 = ${routeMatch[1]}`);
+  }
+}
+
+// 锚定行首：bucket_name 与 BUCKET_NAME 是两个不同的 TOML 键，不能互相误伤
+const bucketMatch = toml.match(/^bucket_name\s*=\s*"([^"]+)"/m);
 if (bucketMatch) ok('R2 bucket_name = ' + bucketMatch[1]);
 else err(`${cfgPath} 缺少 R2 bucket_name`);
 
-if (/DL_DOMAIN\s*=\s*"https?:\/\/[^"]+"/.test(toml)) {
-  const dl = toml.match(/DL_DOMAIN\s*=\s*"([^"]+)"/)[1];
-  ok('DL_DOMAIN = ' + dl);
+// 两处桶名必须一致：[[r2_buckets]] bucket_name 决定 Worker 绑定的桶，
+// [vars] BUCKET_NAME 是 presigned 签名用的桶名（src/index.ts 的 S3 凭证）。
+// 不一致 = 上传签到另一个桶，且在线上下载正常、只有上传默默写错地方。
+const varsBucket = toml.match(/^BUCKET_NAME\s*=\s*"([^"]*)"/m);
+if (!bucketMatch) {
+  // 上面已报「缺少 bucket_name」，这里不重复报
+} else if (!varsBucket) {
+  warn('未设置 [vars] BUCKET_NAME：presigned 直传会拿不到桶名（走 Worker 中转时无影响）');
+} else if (varsBucket[1] !== bucketMatch[1]) {
+  err(
+    `两处桶名不一致：[[r2_buckets]] bucket_name="${bucketMatch[1]}"，[vars] BUCKET_NAME="${varsBucket[1]}"\n` +
+      '     BUCKET_NAME 用于 presigned 签名，不一致会把文件签到另一个桶'
+  );
 } else {
-  err('DL_DOMAIN 未设置或格式异常（应形如 https://dl.example.com）');
+  ok(`两处桶名一致 = ${bucketMatch[1]}`);
+}
+
+// DL_DOMAIN：模板里是空串（本地/代理模式），只有生成物才要求是合法 URL
+if (hasDeployCfg) {
+  if (/^DL_DOMAIN\s*=\s*"https?:\/\/[^"]+"/m.test(toml)) {
+    const dl = toml.match(/^DL_DOMAIN\s*=\s*"([^"]+)"/m)[1];
+    ok('DL_DOMAIN = ' + dl);
+  } else {
+    err('DL_DOMAIN 未设置或格式异常（应形如 https://dl.example.com）');
+  }
 }
 
 // 首页必须显式走 Worker：否则请求会先找同名静态文件，一旦 public/ 出现 index.html，
