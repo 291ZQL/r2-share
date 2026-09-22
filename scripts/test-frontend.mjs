@@ -255,6 +255,10 @@ eq('批量下载先剔掉无效链接（#）', fnBody('batchDownload').includes(
 eq('网格点击不再无条件打开链接', has(/if \(url && url !== '#'\) window\.open\(url, '_blank'\);/), true);
 eq('批量删除失败时不清空选择（旧写法已移除）', has(/state\.sel\.clear\(\);\s*updateBatch\(\);\s*if \(res\.ok\)/), false);
 eq('批量删除只在成功批次里移出选中项', fnBody('batchDelete').includes('for (const p of part) state.sel.delete(p);'), true);
+eq('批量删除对同一原因的失败只提示一次（避免 N 条相同 toast）',
+  fnBody('batchDelete').includes('if (!notifiedErrors.has(msg))'), true);
+eq('批量删除的失败去重是按错误信息、不是按批次（不同原因仍各自可见）',
+  fnBody('batchDelete').includes('notifiedErrors.add(msg);'), true);
 
 group('部署配置：首页必须显式走 Worker');
 const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');

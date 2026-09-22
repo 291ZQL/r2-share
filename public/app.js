@@ -754,6 +754,10 @@ async function batchDelete() {
   // 一个目录里上千个文件全选后整批发过去会被 413 拒掉，一个都删不成。
   const paths = [...state.sel];
   const failed = [];
+  // 同一原因的失败只提示一次：整批失败（会话过期 401、断网）时 N 个批次会给出 N 条
+  // 一模一样的 toast，把后面那条汇总信息淹没掉。toast 是追加不是替换，所以必须在
+  // 这里去重；不同原因仍各自可见。
+  const notifiedErrors = new Set();
   let removed = 0;
   for (const part of chunk(paths, DELETE_CHUNK)) {
     try {
@@ -770,7 +774,11 @@ async function batchDelete() {
       dropIndexPaths(part);
     } catch (err) {
       failed.push(...part);
-      toast(err.message || '删除失败', 'err');
+      const msg = err.message || '删除失败';
+      if (!notifiedErrors.has(msg)) {
+        notifiedErrors.add(msg);
+        toast(msg, 'err');
+      }
     }
   }
   updateBatch();

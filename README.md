@@ -334,7 +334,7 @@ cp .dev.vars.example .dev.vars   # 按需改口令；要跑 deploy/gen-config �
 npm run dev                      # http://127.0.0.1:8787（用模板 wrangler.toml）
 node scripts/seed.mjs            # 灌入演示数据
 TEST_PASSWORD='<.dev.vars 里的 ADMIN_PASSWORD>' node scripts/smoke.mjs   # 全流程冒烟（64 项，含 Range 切片）
-npm test                         # 单元测试（269 项，见下）
+npm test                         # 单元测试（271 项，见下）
 npm run gen-config               # 部署前：生成 wrangler.deploy.toml（域名取自环境变量 / .dev.vars）
 npm run check                    # 部署前自检（校验生成物）
 ```
@@ -352,7 +352,7 @@ npm run check                    # 部署前自检（校验生成物）
 | `scripts/test-mode.mjs` | 运行模式判定（代理/直连、上传通道）、会话密钥派生与守卫 | 25 |
 | `scripts/test-store.mjs` | 路径与 MIME 校验、索引 CAS（含冲突重试、批量幂等、无变化不写、递归删目录）、写入口径与 409 映射契约 | 116 |
 | `scripts/test-preview.mjs` | 前端纯函数：预览分类、Markdown 渲染 | 54 |
-| `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约（分批上限、O(N×M) 回归）+ 部署配置断言 | 60 |
+| `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约（分批上限、失败提示去重、O(N×M) 回归）+ 部署配置断言 | 62 |
 
 `TEST_PASSWORD` 不传时会用默认值 `dev123456`，与 `.dev.vars` 里的真实口令对不上，
 表现为登录 401 之后整串用例连锁失败——**跑冒烟务必显式带上它**。
