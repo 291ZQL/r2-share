@@ -243,12 +243,16 @@ app.get('/api/local-get', async (c) => {
       // bytes=-N：末尾 N 字节
       const n = parseInt(m[2], 10);
       if (n > 0) ropt = { suffix: n };
+    } else if (m[2] === '') {
+      ropt = { offset: parseInt(m[1], 10) }; // bytes=N-：到文件末尾，不给 length 就是开放式
     } else {
+      // 两端都给了：必须在解析阶段就确认 end >= start。
+      // bytes=5-2 这种倒序区间若不拦，length 会算成负数：R2 要么直接抛错、
+      // 要么返回一个对象，让下面 206 分支算出倒序的 content-range（"bytes 5-2/11"）
+      // 和 content-length: 0 —— 两者都是非法响应头。按「非法 Range 一律忽略」处理。
       const start = parseInt(m[1], 10);
-      ropt =
-        m[2] === ''
-          ? { offset: start } // bytes=N-：到文件末尾，不给 length 就是开放式
-          : { offset: start, length: parseInt(m[2], 10) - start + 1 };
+      const end = parseInt(m[2], 10);
+      if (end >= start) ropt = { offset: start, length: end - start + 1 };
     }
   }
 
@@ -528,7 +532,8 @@ app.post('/api/commit', async (c) => {
       // 用对象在 R2 的真实上传时间，而不是本次 commit 的处理时间：
       // ① 与 rebuildIndex 的 t 口径一致（那边取的就是 o.uploaded）；
       // ② t 稳定下来之后，「原样重复提交同一批」在 upsertFiles 里会被判成无变化，
-      //    于是不再写索引 —— 省掉一次读 + 一次写，也少一次 CAS 争用（多端并发时
+      //    于是不再写索引 —— 省掉一次索引写（注意：索引**读**仍会发生，
+      //    因为必须先读出来才能判断有没有变化），也少一次 CAS 争用（多端并发时
       //    它正是 409 的来源之一）。详见 src/store.ts 的 upsertFiles。
       t: obj.uploaded.getTime(),
       // 与 /api/sign、/api/local-put 同一口径：保证索引里的 MIME 与对象实际存储一致

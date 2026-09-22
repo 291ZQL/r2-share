@@ -748,25 +748,37 @@ async function batchDelete() {
     danger: true,
   });
   if (!sure) return;
-  // 一次请求删完：逐个调用 /api/file 会变成 N 次 Worker 请求 + N 次索引读改写，
-  // 服务端的 /api/files 把它们合并成一次批量对象删除 + 一次索引写。
+  // 分批请求：不逐个调用 /api/file（那会变成 N 次 Worker 请求 + N 次索引读改写），
+  // 服务端的 /api/files 把每批合并成一次批量对象删除 + 一次索引写。
+  // 分批而不是一次发完，是因为服务端对单次删除有条数上限（MAX_DELETE_BATCH）：
+  // 一个目录里上千个文件全选后整批发过去会被 413 拒掉，一个都删不成。
   const paths = [...state.sel];
-  const res = await fetch('/api/files', {
-    method: 'DELETE',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ paths }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.ok) {
-    state.sel.clear();
-    updateBatch();
-    toast(`已删除 ${data.removed || 0}/${n}`);
-    dropIndexPaths(paths);
+  const failed = [];
+  let removed = 0;
+  for (const part of chunk(paths, DELETE_CHUNK)) {
+    try {
+      const res = await fetch('/api/files', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paths: part }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '删除失败');
+      // 成功一批就立刻反映一批：后面的批次失败也不影响前面已删的显示
+      removed += data.removed || 0;
+      for (const p of part) state.sel.delete(p);
+      dropIndexPaths(part);
+    } catch (err) {
+      failed.push(...part);
+      toast(err.message || '删除失败', 'err');
+    }
+  }
+  updateBatch();
+  if (failed.length) {
+    // 失败路径保留其选择：清空会让用户以为「这批已经处理完了」，想重试还得重新勾。
+    toast(`已删除 ${removed}/${n}，${failed.length} 个失败（选择已保留）`, 'err');
   } else {
-    // 失败时保留选择：清空会让用户以为「这批已经处理完了」，想重试还得一个个重新勾。
-    // 服务端要么整批成功、要么整批拒绝（路径非法直接 400），没有部分成功的中间态，
-    // 所以「失败就原样保留」是准确语义。
-    toast(data.error || '删除失败', 'err');
+    toast(`已删除 ${removed}/${n}`);
   }
 }
 
@@ -1131,6 +1143,17 @@ function markFail(j, msg) {
  * test-frontend.mjs 有一条断言钉住「前端分批 ≤ 服务端 MAX_COMMIT_BATCH」。
  */
 const UPLOAD_CHUNK = 400;
+
+/**
+ * 单次批量「删除」的条目上限。
+ *
+ * 必须与服务端 src/index.ts 的 MAX_DELETE_BATCH 对齐。删除不像 commit 那样每条
+ * 一个 head（只是 N 个 key 一次 bucket.delete + 索引读写），所以服务端给的是 1000。
+ * 但上限就是上限：一个目录里有 1001 个文件时「全选 → 批量删除」会整批被 413 拒掉，
+ * 一个都删不了——所以前端同样必须分批。
+ * test-frontend.mjs 有一条断言钉住「前端分批 ≤ 服务端 MAX_DELETE_BATCH」。
+ */
+const DELETE_CHUNK = 1000;
 
 /** 把数组切成每块不超过 size 的若干块（size 非正数时原样返回一块） */
 function chunk(arr, size) {

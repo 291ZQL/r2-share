@@ -334,7 +334,7 @@ cp .dev.vars.example .dev.vars   # 按需改口令；要跑 deploy/gen-config �
 npm run dev                      # http://127.0.0.1:8787（用模板 wrangler.toml）
 node scripts/seed.mjs            # 灌入演示数据
 TEST_PASSWORD='<.dev.vars 里的 ADMIN_PASSWORD>' node scripts/smoke.mjs   # 全流程冒烟（64 项，含 Range 切片）
-npm test                         # 单元测试（263 项，见下）
+npm test                         # 单元测试（269 项，见下）
 npm run gen-config               # 部署前：生成 wrangler.deploy.toml（域名取自环境变量 / .dev.vars）
 npm run check                    # 部署前自检（校验生成物）
 ```
@@ -350,9 +350,9 @@ npm run check                    # 部署前自检（校验生成物）
 | --- | --- | --- |
 | `scripts/test-crypto.mjs` | SigV4 签名向量、会话 cookie 加签/验签 | 14 |
 | `scripts/test-mode.mjs` | 运行模式判定（代理/直连、上传通道）、会话密钥派生与守卫 | 25 |
-| `scripts/test-store.mjs` | 路径与 MIME 校验、索引 CAS（含冲突重试、批量幂等、无变化不写、递归删目录）、写入口径与 409 映射契约 | 114 |
+| `scripts/test-store.mjs` | 路径与 MIME 校验、索引 CAS（含冲突重试、批量幂等、无变化不写、递归删目录）、写入口径与 409 映射契约 | 116 |
 | `scripts/test-preview.mjs` | 前端纯函数：预览分类、Markdown 渲染 | 54 |
-| `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约（分批上限、O(N×M) 回归）+ 部署配置断言 | 56 |
+| `scripts/test-frontend.mjs` | 前端状态逻辑（最小 DOM 替身）+ 源码契约（分批上限、O(N×M) 回归）+ 部署配置断言 | 60 |
 
 `TEST_PASSWORD` 不传时会用默认值 `dev123456`，与 `.dev.vars` 里的真实口令对不上，
 表现为登录 401 之后整串用例连锁失败——**跑冒烟务必显式带上它**。
@@ -472,6 +472,11 @@ rclone sync r2:r2share b2:你的桶 --progress
   前端会自动按 400 分片（`public/app.js` 的 `UPLOAD_CHUNK`），
   所以一次拖入上千个文件仍然可用，只是会拆成多次 sign / commit 调用。
   `/api/sign` 不碰 R2、只做 HMAC，上限仍是 1000（`MAX_SIGN_BATCH`）
+- **一次批量删除的条数上限是 1000**（`MAX_DELETE_BATCH`）：删除不比 commit，
+  没有「每条一次 head」，服务端只是把 N 个 key 一次性交给 R2 `delete` + 一次索引读写，
+  所以取 1000。前端同样按 1000 分片（`public/app.js` 的 `DELETE_CHUNK`）——
+  否则一个目录里上千个文件「全选 → 批量删除」会整批被 413 拒掉，一个都删不成。
+  分批还顺带带来更准确的失败语义：成功的批次立刻从列表移除，失败的批次才保留选择
 - 上传接口有登录保护，但文件本身是公开的（这是设计选择）
 - presigned PUT URL 只绑定路径和 1 小时有效期，**不绑定文件大小**：`/api/sign`
   的 size 上限校验是业务约束（`MAX_UPLOAD`，默认 95 MiB），拿到签名 URL 后实际可传更大文件。

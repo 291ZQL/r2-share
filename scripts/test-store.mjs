@@ -379,6 +379,16 @@ group('源码契约：索引写入口径（防回归）');
     idxSrc.includes('existed ? existed.uploaded.getTime() : Date.now()'),
     true
   );
+  // Range 解析必须拒绝倒序区间（bytes=5-2）：放过去的话 length 会算成负数，
+  // R2 要么直接抛错、要么返回对象让 206 分支算出 "bytes 5-2/11" 这种非法响应头。
+  eq('Range 解析拒绝 end < start 的倒序区间', idxSrc.includes('if (end >= start)'), true);
+  // 空转优化省掉的是「写」不是「读」：读仍要发生一次才能判断有没有变化。
+  // 注释若写成「省掉一次读 + 一次写」就与实现不符（实测 puts=0 但 gets=1）。
+  eq(
+    '空转优化的注释不宣称省掉索引读',
+    idxSrc.includes('省掉一次读 + 一次写'),
+    false
+  );
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败\n`);

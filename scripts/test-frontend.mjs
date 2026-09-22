@@ -88,7 +88,7 @@ function load() {
     'window',
     'document',
     `${body}
-return { state, resetSel, applyIndexEntries, dropIndexPaths, kindOf, updateBatch, chunk, UPLOAD_CHUNK };`
+return { state, resetSel, applyIndexEntries, dropIndexPaths, kindOf, updateBatch, chunk, UPLOAD_CHUNK, DELETE_CHUNK };`
   );
   return fn(
     { __CFG__: { dlDomain: 'https://dl.example.com', isLogin: true } },
@@ -233,7 +233,19 @@ eq('每批的 entries 由 part 组装（不再是整批 jobs/done）', has(/entr
   eq('服务端为「N 条 head + 索引读 + 索引写」留了子请求余量', limit + 2 <= 1000, true);
 }
 eq('上传后不再整份重拉索引', fnBody('runBatchUpload').includes('loadIndex'), false);
-eq('批量删除走一次 /api/files', has(/fetch\('\/api\/files'/), true);
+eq('批量删除走 /api/files 合并成批', has(/fetch\('\/api\/files'/), true);
+eq('批量删除按 DELETE_CHUNK 分批', has(/for \(const part of chunk\(paths, DELETE_CHUNK\)\)/), true);
+eq('批量删除不再整批发一次（body 用 part，不是 paths）', fnBody('batchDelete').includes('JSON.stringify({ paths })'), false);
+{
+  // 与上传同一套交叉校验：服务端 MAX_DELETE_BATCH 是硬上限，前端分批必须不大于它。
+  // 只改服务端不改前端 → 上千个文件全选后整批发过去被 413 拒掉，一个都删不掉。
+  const idxSrc = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const m = idxSrc.match(/const MAX_DELETE_BATCH = (\d+);/);
+  const limit = m ? Number(m[1]) : NaN;
+  const apiC = load();
+  eq('能从 src/index.ts 读到 MAX_DELETE_BATCH', Number.isFinite(limit), true);
+  eq('前端 DELETE_CHUNK 不超过服务端 MAX_DELETE_BATCH', apiC.DELETE_CHUNK <= limit, true);
+}
 eq('单个删除改为本地增量', fnBody('deleteOne').includes('dropIndexPaths'), true);
 eq('未登录仍不渲染选择框', has(/CFG\.isLogin\s*\?[\s\S]{0,80}class="sel"/), true);
 eq('dropIndexPaths 不再对每个条目遍历一遍 paths（O(N×M)）', /\.some\(/.test(fnBody('dropIndexPaths')), false);
@@ -242,7 +254,7 @@ eq('批量下载保留 <a download> 触发方式', fnBody('batchDownload').inclu
 eq('批量下载先剔掉无效链接（#）', fnBody('batchDownload').includes("u !== '#'"), true);
 eq('网格点击不再无条件打开链接', has(/if \(url && url !== '#'\) window\.open\(url, '_blank'\);/), true);
 eq('批量删除失败时不清空选择（旧写法已移除）', has(/state\.sel\.clear\(\);\s*updateBatch\(\);\s*if \(res\.ok\)/), false);
-eq('批量删除只在成功分支清空选择', has(/if \(res\.ok\) \{\s*state\.sel\.clear\(\);/), true);
+eq('批量删除只在成功批次里移出选中项', fnBody('batchDelete').includes('for (const p of part) state.sel.delete(p);'), true);
 
 group('部署配置：首页必须显式走 Worker');
 const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
